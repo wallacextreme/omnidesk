@@ -10,6 +10,7 @@ export interface MonitorInfo {
 
 export interface INativeBridge {
   isDesktopApp(): boolean;
+  hasNativeScreenCapture(): boolean;
   getMonitors(): Promise<MonitorInfo[]>;
   captureScreen(monitorId?: string): Promise<MediaStream>;
   injectInput(packet: InputPacket): Promise<boolean>;
@@ -67,14 +68,22 @@ export class NativeBridge implements INativeBridge {
     ];
   }
 
+  public hasNativeScreenCapture(): boolean {
+    return (
+      typeof navigator !== "undefined" &&
+      typeof navigator.mediaDevices !== "undefined" &&
+      typeof navigator.mediaDevices.getDisplayMedia === "function"
+    );
+  }
+
   public async captureScreen(_monitorId?: string): Promise<MediaStream> {
     // If synthetic test stream is forced (e.g. testing on single machine without infinite mirror)
     if (this.forceSyntheticStream) {
       return this.createSyntheticStream();
     }
 
-    // 1. In browser with getDisplayMedia support
-    if (typeof navigator !== "undefined" && navigator.mediaDevices?.getDisplayMedia) {
+    // 1. In browser with getDisplayMedia support (Secure context HTTPS or localhost)
+    if (this.hasNativeScreenCapture()) {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({
           video: {
@@ -92,11 +101,29 @@ export class NativeBridge implements INativeBridge {
 
         return stream;
       } catch (err) {
-        console.warn("[NativeBridge] getDisplayMedia denied or not available, falling back to synthetic stream:", err);
+        console.warn("[NativeBridge] getDisplayMedia denied or cancelled by user, falling back to synthetic stream:", err);
+      }
+    } else {
+      const isHttpLan =
+        typeof window !== "undefined" &&
+        window.location.protocol === "http:" &&
+        window.location.hostname !== "localhost" &&
+        window.location.hostname !== "127.0.0.1";
+
+      if (isHttpLan) {
+        console.warn(
+          "[NativeBridge] navigator.mediaDevices.getDisplayMedia is undefined in non-secure HTTP context.\n" +
+          "ℹ️ Para habilitar captura da tela real no Chrome via IP local (http://" + (window.location.host || "192.168.x.x") + "):\n" +
+          "1. Abra chrome://flags/#unsafely-treat-insecure-origin-as-secure no navegador.\n" +
+          "2. Adicione http://" + (window.location.host || "192.168.x.x") + " e selecione 'Enabled'.\n" +
+          "3. Reinicie o Chrome.\n" +
+          "Ou acesse via HTTPS oficial (https://omnidesk-remote.web.app).\n" +
+          "Fallback ativo: Transmitindo fluxo sintético (Canvas 60 FPS com telemetria)."
+        );
       }
     }
 
-    // 2. Synthetic stream fallback for automated testing / headless environments
+    // 2. Synthetic stream fallback for automated testing / headless environments / non-secure HTTP contexts
     return this.createSyntheticStream();
   }
 

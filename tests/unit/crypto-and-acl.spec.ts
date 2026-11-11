@@ -6,6 +6,13 @@ import {
   verifyAuthProof,
   constantTimeCompare,
   sha256,
+  isSubtleAvailable,
+  jsSha256Raw,
+  jsHmacSha256,
+  jsPbkdf2Sha256,
+  bufferToHex,
+  hexToBuffer,
+  PBKDF2_ITERATIONS,
 } from "../../src/core/crypto";
 import { ACLGuard } from "../../src/core/acl-guard";
 import type { InputPacket, ControlChannelPacket, TransferChannelPacket } from "../../src/shared/protocol";
@@ -84,6 +91,48 @@ describe("Phase 2: Crypto & ACL Guard Quality Gate", () => {
       expect(constantTimeCompare("abc123xyz", "abc123xyz")).toBe(true);
       expect(constantTimeCompare("abc123xyz", "abc123xyw")).toBe(false);
       expect(constantTimeCompare("abc", "abcd")).toBe(false);
+    });
+
+    it("should verify isSubtleAvailable and guarantee deterministic pure JS fallback in insecure HTTP", async () => {
+      expect(typeof isSubtleAvailable).toBe("boolean");
+
+      const testData = new TextEncoder().encode("OmniDesk Insecure HTTP Context Fallback");
+      const jsHash = bufferToHex(jsSha256Raw(testData));
+      expect(jsHash).toHaveLength(64);
+
+      if (isSubtleAvailable) {
+        const webHashBuffer = await crypto.subtle.digest("SHA-256", testData);
+        const webHash = bufferToHex(new Uint8Array(webHashBuffer));
+        expect(jsHash).toBe(webHash);
+      }
+
+      // Test HMAC-SHA256 pure JS against WebCrypto
+      const keyBytes = new TextEncoder().encode("session-secret-key-1234");
+      const jsHmac = bufferToHex(jsHmacSha256(keyBytes, testData));
+      expect(jsHmac).toHaveLength(64);
+
+      if (isSubtleAvailable) {
+        const cKey = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+        const wcHmac = bufferToHex(new Uint8Array(await crypto.subtle.sign("HMAC", cKey, testData)));
+        expect(jsHmac).toBe(wcHmac);
+      }
+
+      // Test Full Auth Proof equivalence between pure JS and computeAuthProof
+      const pwd = "TestMasterPassword#2026";
+      const salt = generateSalt(16);
+      const nonce = generateNonce(32);
+
+      const publicProof = await computeAuthProof(pwd, salt, nonce);
+
+      // Explicitly compute using pure JS engine
+      const pwdBytes = new TextEncoder().encode(pwd);
+      const saltBytes = hexToBuffer(salt);
+      const nonceBytes = hexToBuffer(nonce);
+      const derivedKey = jsPbkdf2Sha256(pwdBytes, saltBytes, PBKDF2_ITERATIONS);
+      const pureJsProof = bufferToHex(jsHmacSha256(derivedKey, nonceBytes));
+
+      expect(publicProof).toBe(pureJsProof);
+      expect(await verifyAuthProof(pwd, salt, nonce, pureJsProof)).toBe(true);
     });
   });
 

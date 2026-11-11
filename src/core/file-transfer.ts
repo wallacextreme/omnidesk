@@ -25,13 +25,28 @@ export interface FileTransferProgress {
   error?: string;
 }
 
+const WINDOWS_RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i;
+
 export function sanitizeFileName(rawName: string): string {
-  // Strip path separators, null bytes, and traversal attempts
-  const clean = rawName
-    .replace(/[\0\r\n]/g, "")
-    .replace(/^.*[\\\/]/, "") // basename
-    .replace(/\.\.+[\\\/]/g, "")
-    .trim();
+  // 1. Strip null bytes, CR, LF, and ASCII control characters (0-31, 127)
+  let clean = rawName.replace(/[\x00-\x1f\x7f\0\r\n]/g, "");
+
+  // 2. Extract basename (strip leading directories and path traversal attempts)
+  clean = clean.replace(/^.*[\\\/]/, "").replace(/\.\.+[\\\/]/g, "");
+
+  // 3. Block NTFS Alternate Data Streams (strip/replace colon ':')
+  clean = clean.replace(/:/g, "_");
+
+  // 4. Strip Windows illegal filesystem characters (<, >, ", |, ?, *)
+  clean = clean.replace(/[<>"|?*]/g, "_");
+
+  // 5. Trim leading/trailing whitespace and trailing dots (invalid in Windows FAT/NTFS)
+  clean = clean.trim().replace(/^[\.\s]+|[\.\s]+$/g, "");
+
+  // 6. Block Windows NT reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+  if (WINDOWS_RESERVED_NAMES.test(clean)) {
+    clean = `safe_${clean}`;
+  }
 
   return clean || "downloaded-file.bin";
 }

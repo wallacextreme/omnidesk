@@ -19,6 +19,14 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       expect(sanitizeFileName("safe_document.pdf")).toBe("safe_document.pdf");
       expect(sanitizeFileName("hidden\0nullbyte.png")).toBe("hiddennullbyte.png");
       expect(sanitizeFileName("")).toBe("downloaded-file.bin");
+
+      // Windows NT Reserved Device Names & NTFS Alternate Data Streams (ADS)
+      expect(sanitizeFileName("CON.txt")).toBe("safe_CON.txt");
+      expect(sanitizeFileName("aux")).toBe("safe_aux");
+      expect(sanitizeFileName("nul.bin")).toBe("safe_nul.bin");
+      expect(sanitizeFileName("COM1.pdf")).toBe("safe_COM1.pdf");
+      expect(sanitizeFileName("LPT3.dat")).toBe("safe_LPT3.dat");
+      expect(sanitizeFileName("document.pdf:hidden.exe")).toBe("document.pdf_hidden.exe");
     });
   });
 

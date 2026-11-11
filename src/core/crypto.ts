@@ -11,7 +11,9 @@ export const isSubtleAvailable: boolean =
     ? Boolean(window.crypto?.subtle && typeof window.crypto.subtle.digest === "function")
     : typeof crypto !== "undefined" && Boolean(crypto.subtle && typeof crypto.subtle.digest === "function");
 
-export const PBKDF2_ITERATIONS = 5_000;
+export const PBKDF2_SUBTLE_ITERATIONS = 600_000;
+export const PBKDF2_FALLBACK_ITERATIONS = 2_000;
+export const PBKDF2_ITERATIONS = isSubtleAvailable ? PBKDF2_SUBTLE_ITERATIONS : PBKDF2_FALLBACK_ITERATIONS;
 
 // Constant-time string comparison to prevent timing attacks
 export function constantTimeCompare(a: string, b: string): boolean {
@@ -202,7 +204,11 @@ export function jsHmacSha256(key: Uint8Array, message: Uint8Array): Uint8Array {
   return jsSha256Raw(outer);
 }
 
-export function jsPbkdf2Sha256(password: Uint8Array, salt: Uint8Array, iterations = PBKDF2_ITERATIONS): Uint8Array {
+export async function jsPbkdf2Sha256(
+  password: Uint8Array,
+  salt: Uint8Array,
+  iterations = PBKDF2_FALLBACK_ITERATIONS
+): Promise<Uint8Array> {
   const blockSize = 64;
   const formattedKey = new Uint8Array(blockSize);
   if (password.length > blockSize) {
@@ -245,6 +251,10 @@ export function jsPbkdf2Sha256(password: Uint8Array, salt: Uint8Array, iteration
       const nextByte = u[j] ?? 0;
       out[j] = current ^ nextByte;
     }
+    // Yield UI thread periodically so legacy systems (Windows 7 / Single-core) never freeze
+    if (i % 250 === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
   }
 
   return out;
@@ -280,9 +290,9 @@ export async function sha256(data: ArrayBuffer | Uint8Array | string): Promise<s
 }
 
 /**
- * Derives an HMAC-SHA256 CryptoKey using PBKDF2 (5,000 iterations).
+ * Derives an HMAC-SHA256 CryptoKey using PBKDF2.
  */
-async function deriveHmacKey(password: string, saltHex: string): Promise<CryptoKey> {
+async function deriveHmacKey(password: string, saltHex: string, iterations: number): Promise<CryptoKey> {
   const enc = new TextEncoder().encode(password);
   const baseAb = new ArrayBuffer(enc.length);
   new Uint8Array(baseAb).set(enc);
@@ -301,7 +311,7 @@ async function deriveHmacKey(password: string, saltHex: string): Promise<CryptoK
     {
       name: "PBKDF2",
       salt: saltBytes.buffer,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: "SHA-256",
     },
     baseKey,
@@ -319,11 +329,14 @@ async function deriveHmacKey(password: string, saltHex: string): Promise<CryptoK
 export async function computeAuthProof(
   password: string,
   saltHex: string,
-  nonceHex: string
+  nonceHex: string,
+  iterations?: number
 ): Promise<string> {
+  const finalIterations = iterations ?? PBKDF2_ITERATIONS;
+
   if (isSubtleAvailable && typeof crypto !== "undefined" && crypto.subtle) {
     try {
-      const key = await deriveHmacKey(password, saltHex);
+      const key = await deriveHmacKey(password, saltHex, finalIterations);
       const nonceBytes = hexToBuffer(nonceHex);
       const signature = await crypto.subtle.sign("HMAC", key, nonceBytes.buffer);
       return bufferToHex(new Uint8Array(signature));
@@ -336,7 +349,7 @@ export async function computeAuthProof(
   const pwdBytes = new TextEncoder().encode(password);
   const saltBytes = hexToBuffer(saltHex);
   const nonceBytes = hexToBuffer(nonceHex);
-  const derivedKey = jsPbkdf2Sha256(pwdBytes, saltBytes, PBKDF2_ITERATIONS);
+  const derivedKey = await jsPbkdf2Sha256(pwdBytes, saltBytes, finalIterations);
   const signature = jsHmacSha256(derivedKey, nonceBytes);
   return bufferToHex(signature);
 }
@@ -365,10 +378,11 @@ export async function verifyAuthProof(
   password: string,
   saltHex: string,
   nonceHex: string,
-  providedProofHex: string
+  providedProofHex: string,
+  iterations?: number
 ): Promise<boolean> {
   try {
-    const expectedProof = await computeAuthProof(password, saltHex, nonceHex);
+    const expectedProof = await computeAuthProof(password, saltHex, nonceHex, iterations);
     return constantTimeCompare(expectedProof, providedProofHex);
   } catch (err) {
     console.error("[Crypto] Verification failed:", err);

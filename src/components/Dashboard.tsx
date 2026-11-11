@@ -19,8 +19,13 @@ import {
   Wifi,
   WifiOff,
   FlaskConical,
+  Cloud,
+  Server,
+  Settings2,
+  X,
 } from "lucide-react";
 import { formatDeviceId, type ACLPermissions } from "../shared/protocol";
+import type { SignalingMode, SignalingStatus } from "../core/signaling-client";
 
 export interface RecentSession {
   id: string;
@@ -32,6 +37,9 @@ export interface RecentSession {
 interface DashboardProps {
   deviceId: string;
   isSignalingOnline: boolean;
+  signalingMode?: SignalingMode;
+  signalingStatus?: SignalingStatus | null;
+  onSwitchSignalingMode?: (mode: SignalingMode, customUrl?: string) => void;
   unattendedPassword: string;
   onUpdateUnattendedPassword: (pwd: string) => void;
   defaultAcl: ACLPermissions;
@@ -50,6 +58,9 @@ interface DashboardProps {
 export const Dashboard: React.FC<DashboardProps> = ({
   deviceId,
   isSignalingOnline,
+  signalingMode = "cloud",
+  signalingStatus,
+  onSwitchSignalingMode,
   unattendedPassword,
   onUpdateUnattendedPassword,
   defaultAcl,
@@ -61,12 +72,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
   isConnecting,
   useSyntheticStream = false,
   onToggleSyntheticStream,
-  signalingUrl,
+  signalingUrl = "ws://localhost:4000",
   onUpdateSignalingUrl,
 }) => {
   const [remoteInput, setRemoteInput] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [showConfigModal, setShowConfigModal] = useState(false);
+  const [selectedMode, setSelectedMode] = useState<SignalingMode>(signalingMode);
+  const [inputLocalUrl, setInputLocalUrl] = useState<string>(signalingUrl);
 
   const handleCopyId = () => {
     if (!deviceId) return;
@@ -103,48 +117,169 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         </div>
 
-        {/* Signaling Status Badge & Config */}
+        {/* Signaling Status Badge & Config Modal Trigger */}
         <div className="flex items-center gap-3">
           <button
             onClick={() => {
-              const current = signalingUrl || (typeof window !== "undefined" ? `ws://${window.location.hostname}:4000` : "ws://localhost:4000");
-              const next = prompt(
-                "Configurar Endereço do Servidor de Sinalização (WebSocket):\nExemplo para 2 PCs na mesma rede: ws://192.168.1.138:4000\nExemplo local: ws://localhost:4000",
-                current
-              );
-              if (next && onUpdateSignalingUrl) {
-                onUpdateSignalingUrl(next.trim());
-              }
+              setSelectedMode(signalingMode);
+              setInputLocalUrl(signalingUrl);
+              setShowConfigModal(true);
             }}
-            title="Clique para configurar o IP do servidor de sinalização"
-            className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs transition-colors cursor-pointer"
+            title="Clique para alternar entre Nuvem WSS e Servidor Local"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs transition-colors cursor-pointer group"
           >
             {isSignalingOnline ? (
               <>
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-slate-300 font-medium">Sinalização Online</span>
+                {signalingMode === "cloud" ? (
+                  <Cloud className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <Server className="w-3.5 h-3.5 text-emerald-400" />
+                )}
+                <span className="text-slate-200 font-medium">
+                  {signalingStatus?.label || (signalingMode === "cloud" ? "Online (Nuvem WSS)" : "Online (Local)")}
+                </span>
               </>
             ) : (
               <>
                 <span className="w-2 h-2 rounded-full bg-rose-400" />
                 <WifiOff className="w-3.5 h-3.5 text-rose-400" />
-                <span className="text-rose-300 font-medium">Desconectado (Alterar IP)</span>
+                <span className="text-rose-300 font-medium">
+                  {signalingStatus?.label || "Desconectado"}
+                </span>
               </>
             )}
+            <Settings2 className="w-3 h-3 text-slate-500 group-hover:text-slate-300 ml-1" />
           </button>
         </div>
       </header>
 
-      {/* Disconnected / HTTPS LAN Guidance Banner */}
+      {/* Disconnected Guidance Banner */}
       {!isSignalingOnline && (
-        <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-start gap-3">
-          <span className="text-base leading-none">⚠️</span>
-          <div>
-            <p className="font-semibold mb-1">Servidor de Sinalização Desconectado</p>
-            <p className="text-slate-300 leading-relaxed">
-              • Se estiver conectando dois computadores reais (ex: <strong>Windows 7</strong> e <strong>Windows 10/11</strong> na mesma rede local): certifique-se de que o servidor está rodando (<code>bun run server</code>) e acesse diretamente pelo IP local: <code className="bg-slate-950 px-1.5 py-0.5 rounded text-amber-200">http://192.168.1.138:5173</code> (para evitar o bloqueio de Mixed Content do Chrome em páginas HTTPS).
+        <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-start justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <span className="text-base leading-none">⚠️</span>
+            <div>
+              <p className="font-semibold mb-1">
+                {signalingMode === "local" ? "Servidor Local de Sinalização Desconectado" : "Conectando ao Broker Nuvem..."}
+              </p>
+              <p className="text-slate-300 leading-relaxed">
+                {signalingMode === "local"
+                  ? "O servidor Bun local (ws://...) não respondeu. Para uso imediato sem servidor, alterne para o Modo Nuvem WSS Zero-Config."
+                  : "Estabelecendo túnel seguro WSS com os servidores públicos de sinalização (EMQX / HiveMQ)..."}
+              </p>
+            </div>
+          </div>
+          {signalingMode === "local" && (
+            <button
+              onClick={() => onSwitchSignalingMode?.("cloud")}
+              className="shrink-0 px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-md shadow-cyan-600/30"
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              Usar Nuvem WSS
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Signaling Configuration Modal */}
+      {showConfigModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-6 shadow-2xl relative">
+            <button
+              onClick={() => setShowConfigModal(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-2 mb-4">
+              <Settings2 className="w-5 h-5 text-cyan-400" />
+              <h2 className="text-lg font-bold text-white">Configuração de Sinalização</h2>
+            </div>
+
+            <p className="text-xs text-slate-400 mb-5 leading-relaxed">
+              Escolha como o OmniDesk estabelece o handshake WebRTC P2P entre este computador e os clientes remotos.
             </p>
+
+            {/* Mode Option 1: Cloud WSS */}
+            <div
+              onClick={() => setSelectedMode("cloud")}
+              className={`p-4 rounded-xl border mb-3 cursor-pointer transition-all ${
+                selectedMode === "cloud"
+                  ? "bg-cyan-950/30 border-cyan-500/60 ring-1 ring-cyan-500/40"
+                  : "bg-slate-950/60 border-slate-800 hover:border-slate-700"
+              }`}
+            >
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center gap-2 font-medium text-sm text-slate-100">
+                  <Cloud className="w-4 h-4 text-cyan-400" />
+                  <span>☁️ Nuvem WSS (Padrão Zero-Config)</span>
+                </div>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-semibold">
+                  Recomendado
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed mb-2">
+                Conecta diretamente via WebSocket Seguro (WSS) sem necessidade de instalar ou rodar nada localmente. Compatível com HTTPS, Windows 7 (Chrome 109) e Windows 10/11.
+              </p>
+              <div className="text-[11px] font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded">
+                Brokers: wss://broker.emqx.io:8084/mqtt + HiveMQ Fallback
+              </div>
+            </div>
+
+            {/* Mode Option 2: Local Server */}
+            <div
+              onClick={() => setSelectedMode("local")}
+              className={`p-4 rounded-xl border mb-6 cursor-pointer transition-all ${
+                selectedMode === "local"
+                  ? "bg-cyan-950/30 border-cyan-500/60 ring-1 ring-cyan-500/40"
+                  : "bg-slate-950/60 border-slate-800 hover:border-slate-700"
+              }`}
+            >
+              <div className="flex items-center gap-2 font-medium text-sm text-slate-100 mb-1.5">
+                <Server className="w-4 h-4 text-blue-400" />
+                <span>🖧 Servidor Local Bun (LAN Isolada)</span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed mb-3">
+                Para redes locais fechadas sem acesso à internet externa. Requer o servidor Bun rodando (<code className="text-cyan-300">bun run server</code>).
+              </p>
+              {selectedMode === "local" && (
+                <div className="space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                  <label className="text-[11px] font-semibold text-slate-300">Endereço WebSocket do Servidor Local:</label>
+                  <input
+                    type="text"
+                    value={inputLocalUrl}
+                    onChange={(e) => setInputLocalUrl(e.target.value)}
+                    placeholder="ws://192.168.1.138:4000 ou ws://localhost:4000"
+                    className="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-mono text-cyan-300 focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setShowConfigModal(false)}
+                className="px-4 py-2 rounded-xl text-xs font-medium text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={() => {
+                  if (onSwitchSignalingMode) {
+                    onSwitchSignalingMode(selectedMode, selectedMode === "local" ? inputLocalUrl.trim() : undefined);
+                  }
+                  if (selectedMode === "local" && onUpdateSignalingUrl) {
+                    onUpdateSignalingUrl(inputLocalUrl.trim());
+                  }
+                  setShowConfigModal(false);
+                }}
+                className="px-5 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition-colors cursor-pointer shadow-lg shadow-cyan-500/20"
+              >
+                Aplicar e Conectar
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -1,6 +1,6 @@
 # RELATÓRIO EXAUSTIVO DE AUDITORIA DO SISTEMA OMNIDESK
 **Documento de Engenharia de Software, Criptografia, Arquitetura e Conformidade**  
-**Versão do Sistema:** OmniDesk v1.0.0 (Produção)  
+**Versão do Sistema:** OmniDesk v1.1.0 (Produção & Windows 7 Zero-Config)  
 **Data do Relatório:** 11 de Novembro de 2026  
 **Autor:** Antigravity Autonomous Engineering & Wallace Soares  
 **Público-Alvo:** Engenheiros de Software Sênior, Auditores de Segurança da Informação, Especialistas em Redes/WebRTC e Modelos de IA de Auditoria Externa.
@@ -140,10 +140,11 @@ Durante os testes de estresse e uso interativo do usuário, dois comportamentos 
 ### 2.9. Fase 8: Suíte de Testes Automatizados (Qualidade 100% Green)
 Foram escritos testes rigorosos distribuídos em duas camadas:
 1. **Testes Unitários e de Criptografia (`tests/unit/` executados com Bun Test Runner):**
-   * `crypto-and-acl.spec.ts`: 10 testes cobrindo geração de nonces criptográficos, prova e verificação HMAC-SHA256, rejeição total a ataques de repetição (Replay Attacks), rejeição de senhas incorretas, computação de SHA-256, algoritmo de comparação em tempo constante (`timingSafeEqual`) e bloqueio rigoroso do Host ACL Guard.
-   * `input-and-file-transfer.spec.ts`: 4 testes cobrindo sanitização contra Path Traversal, normalização geométrica de coordenadas em aspect ratios divergentes e transferência de um arquivo binário de 5 MB particionado em blocos de 64 KB com controle de fluxo por backpressure e validação final de SHA-256.
-   * `protocol-and-signaling.spec.ts`: 7 testes validando esquema Zod de mensagens, formatação de 9 dígitos, rate limiting deslizante e ciclo completo de registro, solicitação, desafio e resposta via WebSocket real.
-   * **Resultado:** **21 testes aprovados, 0 falhas (100% Green).**
+   * `crypto-and-acl.spec.ts`: 12 testes cobrindo geração de nonces criptográficos, prova e verificação HMAC-SHA256, rejeição total a ataques de repetição (Replay Attacks), rejeição de senhas incorretas, computação de SHA-256, algoritmo de comparação em tempo constante (`timingSafeEqual`), bloqueio rigoroso do Host ACL Guard e acionamento do Panic Button com liberação de inputs travados.
+   * `input-and-file-transfer.spec.ts`: 4 testes cobrindo sanitização contra Path Traversal e nomes reservados Windows NT, normalização geométrica de coordenadas em aspect ratios divergentes com detecção de out-of-bounds e transferência de um arquivo binário de 5 MB particionado em blocos de 16 KB com controle de fluxo por backpressure e validação final de SHA-256.
+   * `protocol-and-signaling.spec.ts`: 7 testes validando esquema Zod de mensagens, formatação de 9 dígitos, rate limiting deslizante, validação de hostSecret anti-hijacking e ciclo completo de registro, solicitação, desafio e resposta via WebSocket real.
+   * `cloud-signaling.spec.ts`: 4 testes validando geração criptográfica de IDs de 9 dígitos, geração e persistência de hostSecret de 64 caracteres, endpoints WSS seguros de brokers na nuvem e comutação dinâmica de modo entre Nuvem WSS e Servidor Local.
+   * **Resultado:** **27 testes aprovados, 0 falhas (100% Green).**
 2. **Testes E2E Automatizados (`tests/e2e/anydesk-flow.spec.ts` executados com Playwright):**
    * Verificação completa de renderização de componentes do Dashboard, geração correta de identificadores, ativação de senha de acesso desassistido e simulação de conexão remota.
 
@@ -168,6 +169,38 @@ Foram elaborados documentos técnicos aprofundados com base nas normas internaci
 4. **Publicação no GitHub:**
    * Criação do repositório público **`wallacextreme/omnidesk`** via GitHub CLI (`gh`).
    * Commit inicial da árvore limpa de código com README corporativo, badges de status e histórico de desenvolvimento enviado para o branch `main`.
+
+### 2.12. Fase 11: OmniDesk v1.1.0 — Sinalização Híbrida na Nuvem (WSS Zero-Config) & Blindagens de Segurança e Windows 7
+A versão **v1.1.0** foi desenvolvida para solucionar desafios reais de conectividade em ambientes heterogêneos legados (especialmente **Windows 7 Ultimate** com Chrome 109) e implementar as 5 recomendações críticas da auditoria externa de segurança:
+
+1. **Arquitetura de Sinalização Híbrida na Nuvem (Zero-Config WSS via MQTT-over-WSS):**
+   * *Problema Resolvido:* Ao abrir `https://omnidesk-remote.web.app` diretamente no Windows 7 ou em computadores sem o servidor Bun local rodando, a interface ficava presa em *"Obtendo ID..."* e *"Desconectado"* devido ao bloqueio estrito de *Mixed Content* dos navegadores (página HTTPS bloqueando conexões para `ws://localhost:4000`).
+   * *Módulo Desenvolvido:* `src/core/signaling-client.ts` com abstração polimórfica `ISignalingTransport` e `SignalingClient`.
+   * *Modo Nuvem Zero-Config:* Conexão automática via WebSocket Seguro (`wss://`) usando MQTT-over-WSS com failover contínuo entre brokers públicos de ultra-baixa latência:
+     * Primário: `wss://broker.emqx.io:8084/mqtt`
+     * Secundário (Failover): `wss://broker.hivemq.com:8884/mqtt`
+   * *Registro Serverless de 9 Dígitos:* Geração de IDs numéricos criptográficos persistidos em `localStorage` (`omnidesk_device_id`). Inscrição imediata no tópico exclusivo `omnidesk/v1/peer/${deviceId}` e emissão atômica de `registered`, mudando o status instantaneamente para o badge verde: **"Online (Nuvem WSS)"**.
+   * *Roteamento Direto P2P via Tópico:* Todo pacote de sinalização (`session-request`, `auth-challenge`, `auth-response`, `session-accepted`, `webrtc-signal`, `session-close`) é publicado diretamente no tópico do nó de destino `omnidesk/v1/peer/${targetId}` com `qos: 1, retain: false` e validado rigidamente com Zod.
+   * *Seletor de Modo no Header:* Interface no cabeçalho com modal dedicada permitindo alternar facilmente entre ☁️ Nuvem WSS (Padrão para HTTPS) e 🖧 Servidor Local Bun (`ws://IP:4000`) para LANs offline.
+
+2. **Prevenção contra Sequestro de ID (*ID Hijacking*):**
+   * Adição do campo `hostSecret` (token criptográfico de 64 caracteres hexadecimais persistido em `localStorage`) no esquema `register-host` de `src/shared/protocol.ts`.
+   * Em `server/signaling.ts`, a substituição atômica de socket para um `deviceId` existente só é autorizada se o `hostSecret` apresentado for estritamente igual ao token de registro original (comparado com `timingSafeEqual`). Caso contrário, um novo ID aleatório é atribuído, impedindo que invasores roubem sessões de outros computadores.
+   * Limpeza de conexões zumbis via Ping/Pong a cada 30 segundos.
+
+3. **Blindagem contra Clamping nas Barras Pretas (*Letterboxing/Pillarboxing*):**
+   * No arquivo `src/core/input-controller.ts`, a função de normalização de coordenadas foi aprimorada com o campo booleano `outOfBounds`. Se o clique ocorrer nas faixas pretas fora da proporção útil do vídeo, o evento é descartado com segurança em vez de ser forçado ao ponto `(0,0)`, eliminando disparos acidentais no topo/canto da tela do Host.
+
+4. **Otimização de Codecs (H.264 / VP8) e Fragmentação SCTP (16 KB) para Windows 7:**
+   * Em `src/core/webrtc-manager.ts`, priorização explícita dos codecs **H.264** e **VP8** via `RTCRtpTransceiver.setCodecPreferences`, garantindo decodificação acelerada por hardware em GPUs antigas e prevenindo sobrecarga de CPU de 100% em processadores do Windows 7 ao decodificar software VP9/AV1.
+   * Em `src/core/file-transfer.ts`, chunking reconfigurado para 16 KB (`16 * 1024`), otimizando o transporte sobre SCTP e evitando estouros de buffer no stack WebRTC do Chrome 109.
+   * Sanitização rigorosa contra nomes de arquivos reservados no Windows NT (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`) e NTFS Alternate Data Streams (`:`).
+
+5. **Liberação Automática de Teclas Presas (*Stuck Keys*) no Botão de Pânico:**
+   * Em `src/core/acl-guard.ts` e `src/core/native-bridge.ts`, implementação do método `releaseAllInputs()` invocado automaticamente pelo gatilho `triggerPanic()` ou sempre que `allowInput` for revogado de `true` para `false`, garantindo que teclas modificadoras (`Ctrl`, `Alt`, `Shift`, `Meta`) e botões de mouse fiquem imediatamente soltos na máquina remota.
+
+6. **Performance do PBKDF2 no Fallback HTTP para CPUs Antigas:**
+   * Em `src/core/crypto.ts`, manutenção de 600.000 iterações em HTTPS nativo via `crypto.subtle` C++ e suporte a número adaptativo de iterações em contexto HTTP puro JS com intercalação periódica (`setTimeout(0)`) a cada 250 blocos, evitando travamento da *main thread* da interface no Windows 7.
 
 ---
 

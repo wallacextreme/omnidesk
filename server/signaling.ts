@@ -6,6 +6,7 @@ import {
   type SignalingMessage,
   type ACLPermissions,
 } from "../src/shared/protocol";
+import { constantTimeCompare } from "../src/core/crypto";
 
 export interface WSClientData {
   id: string;
@@ -14,6 +15,7 @@ export interface WSClientData {
   deviceName: string;
   unattendedEnabled: boolean;
   passwordHash?: string;
+  hostSecret?: string;
 }
 
 export class RateLimiter {
@@ -47,6 +49,7 @@ export class SignalingServer {
   private server: ReturnType<typeof Bun.serve<WSClientData>> | null = null;
   private hosts = new Map<string, ServerWebSocket<WSClientData>>();
   private rateLimiter: RateLimiter;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(port = 4000, rateLimiter = new RateLimiter(150, 10000)) {
     this.port = port;
@@ -103,11 +106,29 @@ export class SignalingServer {
       },
     });
 
+    this.pingInterval = setInterval(() => {
+      for (const [id, hostWs] of self.hosts.entries()) {
+        try {
+          if (hostWs.readyState === 1) {
+            hostWs.send(JSON.stringify({ type: "ping" }));
+          } else {
+            self.hosts.delete(id);
+          }
+        } catch {
+          self.hosts.delete(id);
+        }
+      }
+    }, 30000);
+
     console.log(`[OmniDesk Signaling] Server listening on ws://localhost:${this.port}`);
     return this.server;
   }
 
   public stop(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
     if (this.server) {
       this.server.stop(true);
       this.server = null;
@@ -207,12 +228,28 @@ export class SignalingServer {
           if (isValidDeviceId(normalized)) {
             const existing = this.hosts.get(normalized);
             if (existing && existing !== ws) {
-              try {
-                existing.close();
-              } catch {}
-              this.hosts.delete(normalized);
+              // ID Hijacking Protection: verify hostSecret if already claimed
+              const existingSecret = existing.data.hostSecret;
+              const matchesSecret =
+                existingSecret &&
+                msg.hostSecret &&
+                constantTimeCompare(existingSecret, msg.hostSecret);
+
+              if (matchesSecret || !existingSecret) {
+                try {
+                  existing.close();
+                } catch {}
+                this.hosts.delete(normalized);
+                assignedId = normalized;
+              } else {
+                console.warn(
+                  `[Signaling] Prevented ID Hijacking attempt on ${normalized}. Assigning new unique ID.`
+                );
+                assignedId = this.generateUniqueId();
+              }
+            } else {
+              assignedId = normalized;
             }
-            assignedId = normalized;
           }
         }
 
@@ -224,6 +261,9 @@ export class SignalingServer {
         ws.data.isRegistered = true;
         ws.data.deviceName = msg.deviceName;
         ws.data.unattendedEnabled = msg.unattendedEnabled;
+        if (msg.hostSecret) {
+          ws.data.hostSecret = msg.hostSecret;
+        }
         if (msg.passwordHash !== undefined) {
           ws.data.passwordHash = msg.passwordHash;
         }

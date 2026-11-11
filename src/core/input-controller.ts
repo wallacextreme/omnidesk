@@ -11,9 +11,16 @@ export interface InputControllerCallbacks {
   onInputPacket: (packet: InputPacket) => void;
 }
 
+export interface NormalizedCoordinates {
+  x: number;
+  y: number;
+  outOfBounds: boolean;
+}
+
 /**
  * Normalizes coordinates between client viewport and remote display resolution
  * taking into account object-fit: contain letterboxing / pillarboxing.
+ * Discards clicks and movements on letterboxed/pillarboxed black bars.
  */
 export function calculateNormalizedCoordinates(
   clientX: number,
@@ -21,12 +28,12 @@ export function calculateNormalizedCoordinates(
   containerRect: DOMRect,
   videoWidth: number,
   videoHeight: number
-): { x: number; y: number } {
+): NormalizedCoordinates {
   const containerW = containerRect.width;
   const containerH = containerRect.height;
 
   if (containerW <= 0 || containerH <= 0 || videoWidth <= 0 || videoHeight <= 0) {
-    return { x: 0, y: 0 };
+    return { x: 0, y: 0, outOfBounds: true };
   }
 
   const containerRatio = containerW / containerH;
@@ -52,12 +59,18 @@ export function calculateNormalizedCoordinates(
   const localX = clientX - containerRect.left - offsetX;
   const localY = clientY - containerRect.top - offsetY;
 
-  const xNorm = Math.min(1, Math.max(0, localX / renderedW));
-  const yNorm = Math.min(1, Math.max(0, localY / renderedH));
+  const rawXNorm = localX / renderedW;
+  const rawYNorm = localY / renderedH;
+
+  const outOfBounds = rawXNorm < 0 || rawXNorm > 1 || rawYNorm < 0 || rawYNorm > 1;
+
+  const xNorm = Math.min(1, Math.max(0, rawXNorm));
+  const yNorm = Math.min(1, Math.max(0, rawYNorm));
 
   return {
     x: Math.round(xNorm * 10000) / 10000,
     y: Math.round(yNorm * 10000) / 10000,
+    outOfBounds,
   };
 }
 
@@ -112,8 +125,8 @@ export class InputController {
     });
   }
 
-  private getCoordinates(e: MouseEvent): { x: number; y: number } {
-    if (!this.element) return { x: 0, y: 0 };
+  private getCoordinates(e: MouseEvent): NormalizedCoordinates {
+    if (!this.element) return { x: 0, y: 0, outOfBounds: true };
     const rect = this.element.getBoundingClientRect();
     const vW = this.videoElement?.videoWidth || 1920;
     const vH = this.videoElement?.videoHeight || 1080;
@@ -128,11 +141,13 @@ export class InputController {
     }
     this.lastMoveTime = now;
 
-    const { x, y } = this.getCoordinates(e);
+    const coords = this.getCoordinates(e);
+    if (coords.outOfBounds) return;
+
     this.callbacks.onInputPacket({
       kind: "mouse-move",
-      x,
-      y,
+      x: coords.x,
+      y: coords.y,
     });
   };
 
@@ -141,25 +156,30 @@ export class InputController {
     if (this.element && document.activeElement !== this.element) {
       this.element.focus();
     }
-    const { x, y } = this.getCoordinates(e);
+    const coords = this.getCoordinates(e);
+    // Ignore clicks on letterboxed/pillarboxed black bars to prevent accidental clicks at (0, 0)
+    if (coords.outOfBounds) return;
+
     const button = this.resolveButton(e.button);
     this.callbacks.onInputPacket({
       kind: "mouse-down",
       button,
-      x,
-      y,
+      x: coords.x,
+      y: coords.y,
     });
   };
 
   private handleMouseUp = (e: MouseEvent): void => {
     e.preventDefault();
-    const { x, y } = this.getCoordinates(e);
+    const coords = this.getCoordinates(e);
+    if (coords.outOfBounds) return;
+
     const button = this.resolveButton(e.button);
     this.callbacks.onInputPacket({
       kind: "mouse-up",
       button,
-      x,
-      y,
+      x: coords.x,
+      y: coords.y,
     });
   };
 

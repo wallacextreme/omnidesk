@@ -5,6 +5,7 @@ import type {
   TransferChannelPacket,
 } from "../shared/protocol";
 import { DEFAULT_ACL_PERMISSIONS } from "../shared/protocol";
+import { nativeBridge } from "./native-bridge";
 
 export type ACLChangeListener = (permissions: ACLPermissions) => void;
 
@@ -36,6 +37,9 @@ export class ACLGuard {
     if (updates.allowInput !== undefined && updates.allowInput !== this.permissions.allowInput) {
       this.permissions.allowInput = updates.allowInput;
       hasChanged = true;
+      if (!updates.allowInput) {
+        nativeBridge.releaseAllInputs();
+      }
     }
     if (updates.allowClipboard !== undefined && updates.allowClipboard !== this.permissions.allowClipboard) {
       this.permissions.allowClipboard = updates.allowClipboard;
@@ -56,7 +60,26 @@ export class ACLGuard {
   }
 
   public setAll(permissions: ACLPermissions): void {
+    const wasAllowInput = this.permissions.allowInput;
     this.permissions = { ...permissions };
+    if (wasAllowInput && !this.permissions.allowInput) {
+      nativeBridge.releaseAllInputs();
+    }
+    this.notifyListeners();
+  }
+
+  /**
+   * Emergency Panic Button.
+   * Immediately revokes all remote control permissions and releases any stuck keys or mouse buttons.
+   */
+  public triggerPanic(): void {
+    this.permissions = {
+      allowInput: false,
+      allowClipboard: false,
+      allowFileTransfer: false,
+      allowAudio: false,
+    };
+    nativeBridge.releaseAllInputs();
     this.notifyListeners();
   }
 

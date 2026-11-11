@@ -87,6 +87,7 @@ export const RegisterHostMsgSchema = z.object({
   deviceName: z.string().min(1).max(64),
   unattendedEnabled: z.boolean(),
   passwordHash: z.string().optional(),
+  hostSecret: z.string().min(16).max(128).optional(),
 });
 export type RegisterHostMsg = z.infer<typeof RegisterHostMsgSchema>;
 
@@ -131,6 +132,7 @@ export const AuthChallengeMsgSchema = z.object({
   senderId: z.string().length(9),
   nonce: z.string().min(16),
   salt: z.string().min(16),
+  iterations: z.number().int().positive().optional(),
 });
 export type AuthChallengeMsg = z.infer<typeof AuthChallengeMsgSchema>;
 

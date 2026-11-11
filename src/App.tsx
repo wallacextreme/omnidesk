@@ -12,7 +12,14 @@ import {
   computeAuthProof,
   verifyAuthProof,
   safeRandomUUID,
+  isSubtleAvailable,
 } from "./core/crypto";
+import {
+  SignalingClient,
+  type SignalingMode,
+  type SignalingStatus,
+  getOrCreateHostSecret,
+} from "./core/signaling-client";
 import {
   DEFAULT_ACL_PERMISSIONS,
   normalizeDeviceId,
@@ -134,15 +141,30 @@ export const App: React.FC = () => {
   });
 
   // Refs for persistent state without re-triggering effects
+  const [signalingMode, setSignalingMode] = useState<SignalingMode>(() => {
+    if (typeof localStorage !== "undefined") {
+      const saved = localStorage.getItem("omnidesk_signaling_mode");
+      if (saved === "cloud" || saved === "local") return saved;
+    }
+    return "cloud";
+  });
+  const [signalingStatus, setSignalingStatus] = useState<SignalingStatus | null>(null);
+
   const deviceIdRef = useRef<string>(deviceId);
   const unattendedPasswordRef = useRef<string>(unattendedPassword);
   const defaultAclRef = useRef<ACLPermissions>(defaultAcl);
-  const wsRef = useRef<WebSocket | null>(null);
+  const signalingClientRef = useRef<SignalingClient | null>(null);
+  const hostSecretRef = useRef<string>(getOrCreateHostSecret());
   const webrtcRef = useRef<WebRTCManager | null>(null);
   const aclGuardRef = useRef<ACLGuard>(new ACLGuard(DEFAULT_ACL_PERMISSIONS));
   const fileSenderRef = useRef<FileSender | null>(null);
   const fileReceiverRef = useRef<FileReceiver | null>(null);
-  const currentChallengeRef = useRef<{ nonce: string; salt: string; clientDeviceId: string } | null>(null);
+  const currentChallengeRef = useRef<{
+    nonce: string;
+    salt: string;
+    clientDeviceId: string;
+    iterations?: number;
+  } | null>(null);
   const pendingPasswordRef = useRef<string>("");
 
   // Sync state to refs
@@ -152,15 +174,14 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     unattendedPasswordRef.current = unattendedPassword;
-    if (wsRef.current?.readyState === WebSocket.OPEN && deviceIdRef.current) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: "register-host",
-          deviceId: deviceIdRef.current,
-          deviceName,
-          unattendedEnabled: Boolean(unattendedPassword),
-        })
-      );
+    if (signalingClientRef.current && deviceIdRef.current) {
+      signalingClientRef.current.send({
+        type: "register-host",
+        deviceId: deviceIdRef.current,
+        deviceName,
+        unattendedEnabled: Boolean(unattendedPassword),
+        hostSecret: hostSecretRef.current,
+      });
     }
   }, [unattendedPassword, deviceName]);
 
@@ -177,9 +198,15 @@ export const App: React.FC = () => {
 
   // Send signaling message helper
   const sendSignaling = useCallback((msg: SignalingMessage) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+    signalingClientRef.current?.send(msg);
+  }, []);
+
+  const handleSwitchSignalingMode = useCallback((mode: SignalingMode, customUrl?: string) => {
+    setSignalingMode(mode);
+    if (customUrl) {
+      setSignalingUrl(customUrl);
     }
+    signalingClientRef.current?.switchMode(mode, customUrl);
   }, []);
 
   // WebRTC Setup Helper
@@ -285,189 +312,166 @@ export const App: React.FC = () => {
 
   // Initialize Signaling Connection ONCE on mount
   useEffect(() => {
-    let reconnectTimer: ReturnType<typeof setTimeout>;
-    let isMounted = true;
-
-    function connect() {
-      if (!isMounted) return;
-
-      try {
-        const ws = new WebSocket(signalingUrl);
-        wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!isMounted) return;
-        setIsSignalingOnline(true);
-
-        const currentId = deviceIdRef.current;
-        ws.send(
-          JSON.stringify({
-            type: "register-host",
-            ...(currentId ? { deviceId: currentId } : {}),
-            deviceName,
-            unattendedEnabled: Boolean(unattendedPasswordRef.current),
-          })
-        );
-      };
-
-      ws.onmessage = async (event) => {
-        try {
-          const raw = JSON.parse(event.data);
-          const msg = parseSignalingMessage(raw);
-          if (!msg || !isMounted) return;
-
-          switch (msg.type) {
-            case "registered": {
-              setDeviceId(msg.deviceId);
-              deviceIdRef.current = msg.deviceId;
-              try {
-                localStorage.setItem("omnidesk_device_id", msg.deviceId);
-              } catch {}
-              break;
-            }
-
-            case "session-request": {
-              // Host receives connection request from client
-              if (msg.hasUnattendedPassword && unattendedPasswordRef.current) {
-                // Unattended challenge flow
-                const nonce = generateNonce(32);
-                const salt = generateSalt(16);
-                currentChallengeRef.current = {
-                  nonce,
-                  salt,
-                  clientDeviceId: msg.clientDeviceId,
-                };
-                sendSignaling({
-                  type: "auth-challenge",
-                  targetId: msg.clientDeviceId,
-                  senderId: deviceIdRef.current,
-                  nonce,
-                  salt,
-                });
-              } else {
-                // Manual modal prompt
-                setIncomingRequest({
-                  clientDeviceId: msg.clientDeviceId,
-                  clientName: msg.clientName,
-                  hasUnattendedPassword: msg.hasUnattendedPassword,
-                });
+    const client = new SignalingClient(
+      {
+        onStatusChange: (status) => {
+          setIsSignalingOnline(status.online);
+          setSignalingStatus(status);
+        },
+        onRegistered: (registeredId) => {
+          setDeviceId(registeredId);
+          deviceIdRef.current = registeredId;
+          try {
+            localStorage.setItem("omnidesk_device_id", registeredId);
+          } catch {}
+        },
+        onMessage: async (msg) => {
+          try {
+            switch (msg.type) {
+              case "registered": {
+                setDeviceId(msg.deviceId);
+                deviceIdRef.current = msg.deviceId;
+                try {
+                  localStorage.setItem("omnidesk_device_id", msg.deviceId);
+                } catch {}
+                break;
               }
-              break;
-            }
 
-            case "auth-challenge": {
-              // Client receives challenge from host
-              const pwd = pendingPasswordRef.current;
-              if (pwd) {
-                const proof = await computeAuthProof(pwd, msg.salt, msg.nonce);
-                sendSignaling({
-                  type: "auth-response",
-                  targetId: msg.senderId,
-                  senderId: deviceIdRef.current,
-                  proof,
-                });
-              } else {
-                sendSignaling({
-                  type: "session-rejected",
-                  targetId: msg.senderId,
-                  reason: "Senha de acesso desassistido requerida mas não fornecida.",
-                });
-              }
-              break;
-            }
-
-            case "auth-response": {
-              // Host receives proof from client
-              const challenge = currentChallengeRef.current;
-              if (challenge && challenge.clientDeviceId === msg.senderId) {
-                const isValid = await verifyAuthProof(
-                  unattendedPasswordRef.current,
-                  challenge.salt,
-                  challenge.nonce,
-                  msg.proof
-                );
-
-                if (isValid) {
-                  // Approved!
+              case "session-request": {
+                // Host receives connection request from client
+                if (msg.hasUnattendedPassword && unattendedPasswordRef.current) {
+                  // Unattended challenge flow
+                  const nonce = generateNonce(32);
+                  const salt = generateSalt(16);
+                  const iterations = isSubtleAvailable ? 600_000 : 2_000;
+                  currentChallengeRef.current = {
+                    nonce,
+                    salt,
+                    clientDeviceId: msg.clientDeviceId,
+                    iterations,
+                  };
                   sendSignaling({
-                    type: "session-accepted",
+                    type: "auth-challenge",
+                    targetId: msg.clientDeviceId,
+                    senderId: deviceIdRef.current,
+                    nonce,
+                    salt,
+                    iterations,
+                  });
+                } else {
+                  // Manual modal prompt
+                  setIncomingRequest({
+                    clientDeviceId: msg.clientDeviceId,
+                    clientName: msg.clientName,
+                    hasUnattendedPassword: msg.hasUnattendedPassword,
+                  });
+                }
+                break;
+              }
+
+              case "auth-challenge": {
+                // Client receives challenge from host
+                const pwd = pendingPasswordRef.current;
+                if (pwd) {
+                  const proof = await computeAuthProof(pwd, msg.salt, msg.nonce, msg.iterations);
+                  sendSignaling({
+                    type: "auth-response",
                     targetId: msg.senderId,
                     senderId: deviceIdRef.current,
-                    permissions: defaultAclRef.current,
+                    proof,
                   });
-                  await setupWebRTCRef.current("host", msg.senderId);
                 } else {
                   sendSignaling({
                     type: "session-rejected",
                     targetId: msg.senderId,
-                    reason: "Senha de acesso desassistido incorreta.",
+                    reason: "Senha de acesso desassistido requerida mas não fornecida.",
                   });
                 }
-                currentChallengeRef.current = null;
+                break;
               }
-              break;
-            }
 
-            case "session-accepted": {
-              // Client receives acceptance from host
-              setActiveAcl(msg.permissions);
-              aclGuardRef.current.setAll(msg.permissions);
-              await setupWebRTCRef.current("client", msg.senderId);
-              break;
-            }
+              case "auth-response": {
+                // Host receives proof from client
+                const challenge = currentChallengeRef.current;
+                if (challenge && challenge.clientDeviceId === msg.senderId) {
+                  const isValid = await verifyAuthProof(
+                    unattendedPasswordRef.current,
+                    challenge.salt,
+                    challenge.nonce,
+                    msg.proof,
+                    challenge.iterations
+                  );
 
-            case "session-rejected": {
-              setIsConnecting(false);
-              alert(`Conexão recusada: ${msg.reason}`);
-              break;
-            }
-
-            case "webrtc-signal": {
-              if (webrtcRef.current) {
-                await webrtcRef.current.handleRemoteSignal(msg.signal);
+                  if (isValid) {
+                    // Approved!
+                    sendSignaling({
+                      type: "session-accepted",
+                      targetId: msg.senderId,
+                      senderId: deviceIdRef.current,
+                      permissions: defaultAclRef.current,
+                    });
+                    await setupWebRTCRef.current("host", msg.senderId);
+                  } else {
+                    sendSignaling({
+                      type: "session-rejected",
+                      targetId: msg.senderId,
+                      reason: "Senha de acesso desassistido incorreta.",
+                    });
+                  }
+                  currentChallengeRef.current = null;
+                }
+                break;
               }
-              break;
-            }
 
-            case "session-close": {
-              handleEndSession();
-              break;
+              case "session-accepted": {
+                // Client receives acceptance from host
+                setActiveAcl(msg.permissions);
+                aclGuardRef.current.setAll(msg.permissions);
+                await setupWebRTCRef.current("client", msg.senderId);
+                break;
+              }
+
+              case "session-rejected": {
+                setIsConnecting(false);
+                alert(`Conexão recusada: ${msg.reason}`);
+                break;
+              }
+
+              case "webrtc-signal": {
+                if (webrtcRef.current) {
+                  await webrtcRef.current.handleRemoteSignal(msg.signal);
+                }
+                break;
+              }
+
+              case "session-close": {
+                handleEndSession();
+                break;
+              }
             }
+          } catch (err) {
+            console.error("[Signaling] Message error:", err);
           }
-        } catch (err) {
-          console.error("[Signaling] Message error:", err);
-        }
-      };
+        },
+      },
+      signalingMode,
+      signalingUrl
+    );
 
-      ws.onclose = () => {
-        if (!isMounted) return;
-        setIsSignalingOnline(false);
-        reconnectTimer = setTimeout(connect, 3000);
-      };
+    signalingClientRef.current = client;
 
-        ws.onerror = () => {
-          try {
-            ws.close();
-          } catch {}
-        };
-      } catch (err) {
-        console.warn("[Signaling] WebSocket initialization exception:", err);
-        if (!isMounted) return;
-        setIsSignalingOnline(false);
-        reconnectTimer = setTimeout(connect, 4000);
-      }
-    }
-
-    connect();
+    client.connect({
+      deviceId: deviceIdRef.current || undefined,
+      deviceName,
+      unattendedEnabled: Boolean(unattendedPasswordRef.current),
+      hostSecret: hostSecretRef.current,
+    });
 
     return () => {
-      isMounted = false;
-      clearTimeout(reconnectTimer);
-      try {
-        wsRef.current?.close();
-      } catch {}
+      client.disconnect();
+      signalingClientRef.current = null;
     };
-  }, [signalingUrl, deviceName, sendSignaling]);
+  }, [signalingMode, signalingUrl, deviceName, sendSignaling]);
 
   // Client Initiates Connection
   const handleConnect = (targetRaw: string, password?: string) => {
@@ -650,6 +654,9 @@ export const App: React.FC = () => {
         <Dashboard
           deviceId={deviceId}
           isSignalingOnline={isSignalingOnline}
+          signalingMode={signalingMode}
+          signalingStatus={signalingStatus}
+          onSwitchSignalingMode={handleSwitchSignalingMode}
           unattendedPassword={unattendedPassword}
           onUpdateUnattendedPassword={setUnattendedPassword}
           defaultAcl={defaultAcl}

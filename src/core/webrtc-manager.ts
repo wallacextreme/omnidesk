@@ -28,6 +28,8 @@ export const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
   ],
   iceCandidatePoolSize: 4,
 };
@@ -69,6 +71,7 @@ export class WebRTCManager {
       for (const track of this.localStream.getTracks()) {
         this.pc.addTrack(track, this.localStream);
       }
+      this.prioritizeLightweightCodecs();
     } catch (err) {
       console.error("[WebRTCManager] Failed to capture screen for host:", err);
     }
@@ -221,6 +224,47 @@ export class WebRTCManager {
     if (this.pc) {
       this.pc.close();
       this.pc = null;
+    }
+  }
+
+  private prioritizeLightweightCodecs(): void {
+    if (
+      typeof RTCRtpSender !== "undefined" &&
+      typeof RTCRtpSender.getCapabilities === "function" &&
+      this.pc
+    ) {
+      try {
+        const capabilities = RTCRtpSender.getCapabilities("video");
+        if (capabilities && capabilities.codecs) {
+          const preferredCodecs = [...capabilities.codecs].sort((a, b) => {
+            const mimeA = a.mimeType.toLowerCase();
+            const mimeB = b.mimeType.toLowerCase();
+            const score = (mime: string) => {
+              if (mime.includes("h264")) return 1;
+              if (mime.includes("vp8")) return 2;
+              if (mime.includes("vp9")) return 3;
+              if (mime.includes("av1")) return 4;
+              return 5;
+            };
+            return score(mimeA) - score(mimeB);
+          });
+
+          for (const transceiver of this.pc.getTransceivers()) {
+            if (
+              transceiver.sender.track?.kind === "video" &&
+              typeof transceiver.setCodecPreferences === "function"
+            ) {
+              try {
+                transceiver.setCodecPreferences(preferredCodecs);
+              } catch (err) {
+                console.warn("[WebRTC] setCodecPreferences failed:", err);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[WebRTC] prioritizeLightweightCodecs error:", err);
+      }
     }
   }
 

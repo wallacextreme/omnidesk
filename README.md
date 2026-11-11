@@ -19,10 +19,13 @@
 
 ## 🌟 Principais Recursos
 
-- **Zero-Latency P2P WebRTC Pipeline:** Streaming de vídeo a 60 FPS com codec VP9/AV1 e canais de dados dedicados (`omnidesk-control` e `omnidesk-files`).
-- **Segurança Zero-Trust:** Criptografia ponta a ponta com autenticação de desafio PBKDF2-SHA256 (600.000 iterações), nonces anti-replay de 32 bytes e comparação de tempo constante para proteção contra timing attacks.
-- **Controle de Acesso Granular (ACL):** Host possui controle rigoroso por sessão sobre Mouse/Teclado, Área de Transferência, Envio de Arquivos e Áudio, com botão de emergência instantâneo (*Panic Button*).
-- **Transferência de Arquivos Segura:** Chunking de 64 KB com controle de fluxo por backpressure (`bufferedAmountLowThreshold`) e validação de integridade por hash SHA-256 no destino.
+- **Zero-Config Cloud WSS Signaling (v1.1.0):** Funciona instantaneamente na nuvem via WebSocket Seguro (MQTT-over-WSS) sem necessidade de servidor local ou configuração de portas, eliminando bloqueios de Mixed Content no Windows 7 (Chrome 109) e Windows 10/11.
+- **Modo Híbrido Local & Nuvem:** Alternância com 1 clique entre Nuvem WSS Zero-Config e Servidor Bun Local (`ws://IP:4000`) para redes LAN isoladas.
+- **Proteção contra ID Hijacking:** Token criptográfico de 64 caracteres (`hostSecret`) com verificação em tempo constante (`timingSafeEqual`) garantindo que nenhum invasor tome o ID de outro host.
+- **Zero-Latency P2P WebRTC Pipeline:** Streaming de vídeo a 60 FPS com priorização inteligente de codecs (H.264 / VP8 para máquinas legadas; VP9/AV1 para alta densidade) e múltiplos servidores STUN (Google e Cloudflare).
+- **Segurança Zero-Trust:** Criptografia ponta a ponta com autenticação de desafio PBKDF2-SHA256 (600.000 iterações em HTTPS nativo e loop yielding não bloqueante em HTTP), nonces anti-replay de 32 bytes e comparação de tempo constante para proteção contra timing attacks.
+- **Controle de Acesso Granular (ACL):** Host possui controle rigoroso por sessão sobre Mouse/Teclado, Área de Transferência, Envio de Arquivos e Áudio, com botão de emergência instantâneo (*Panic Button*) com liberação automática de teclas presas (*stuck keys*).
+- **Transferência de Arquivos Segura:** Chunking otimizado de 16 KB com controle de fluxo por backpressure (`bufferedAmountLowThreshold`), validação de integridade por hash SHA-256 no destino e sanitização contra Windows NT reserved names (`CON`, `PRN`, `AUX`, `NUL`, etc.) e NTFS Alternate Data Streams (`:`).
 - **PWA Offline-First:** Service Worker com cache resiliente e suporte para instalação em qualquer sistema operacional (Windows, Linux, macOS, Android, iOS).
 - **Core Desktop Nativo:** Arquitetura híbrida pronta para Tauri v2 em Rust para injeção de hardware de alta performance no Windows, Linux e macOS.
 

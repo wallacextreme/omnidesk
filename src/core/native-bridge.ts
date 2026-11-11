@@ -14,6 +14,7 @@ export interface INativeBridge {
   getMonitors(): Promise<MonitorInfo[]>;
   captureScreen(monitorId?: string): Promise<MediaStream>;
   injectInput(packet: InputPacket): Promise<boolean>;
+  releaseAllInputs(): Promise<boolean>;
   readClipboard(): Promise<string>;
   writeClipboard(text: string): Promise<boolean>;
 }
@@ -154,6 +155,18 @@ export class NativeBridge implements INativeBridge {
       }
     }
 
+    return true;
+  }
+
+  public async releaseAllInputs(): Promise<boolean> {
+    if (this.isDesktopApp() && window.__TAURI__?.core) {
+      try {
+        await window.__TAURI__.core.invoke("release_all_inputs");
+        return true;
+      } catch (err) {
+        console.warn("[NativeBridge] Tauri release_all_inputs error:", err);
+      }
+    }
     return true;
   }
 

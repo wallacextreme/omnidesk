@@ -81,14 +81,17 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       const center = calculateNormalizedCoordinates(1000, 250, rect, 1920, 1080);
       expect(center.x).toBe(0.5);
       expect(center.y).toBe(0.5);
+      expect(center.outOfBounds).toBe(false);
 
-      // Click in black bar area far left (e.g. x = 100): should clamp x to 0
+      // Click in black bar area far left (e.g. x = 100): should clamp x to 0 and mark outOfBounds
       const leftPillar = calculateNormalizedCoordinates(100, 250, rect, 1920, 1080);
       expect(leftPillar.x).toBe(0);
+      expect(leftPillar.outOfBounds).toBe(true);
 
-      // Click in black bar area far right (e.g. x = 1950): should clamp x to 1
+      // Click in black bar area far right (e.g. x = 1950): should clamp x to 1 and mark outOfBounds
       const rightPillar = calculateNormalizedCoordinates(1950, 250, rect, 1920, 1080);
       expect(rightPillar.x).toBe(1);
+      expect(rightPillar.outOfBounds).toBe(true);
     });
   });
 
@@ -146,10 +149,10 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       const transferId = await sender.sendFile(mockFile);
       expect(transferId).toBeDefined();
 
-      // Ensure chunks were generated (5MB / 64KB = 80 chunks + 1 metadata packet = 81 packets)
+      // Ensure chunks were generated dynamically based on CHUNK_SIZE
       const expectedTotalChunks = Math.ceil(FILE_SIZE / CHUNK_SIZE);
-      expect(expectedTotalChunks).toBe(80);
-      expect(packetsQueue.length).toBe(81); // 1 meta + 80 chunks
+      expect(expectedTotalChunks).toBe(320); // 5MB / 16KB = 320 chunks
+      expect(packetsQueue.length).toBe(expectedTotalChunks + 1); // 1 meta + 320 chunks
 
       // Process packets on receiver
       for (const packet of packetsQueue) {

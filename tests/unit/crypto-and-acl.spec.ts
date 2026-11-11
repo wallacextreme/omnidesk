@@ -121,18 +121,19 @@ describe("Phase 2: Crypto & ACL Guard Quality Gate", () => {
       const pwd = "TestMasterPassword#2026";
       const salt = generateSalt(16);
       const nonce = generateNonce(32);
+      const testIterations = 1_000;
 
-      const publicProof = await computeAuthProof(pwd, salt, nonce);
+      const publicProof = await computeAuthProof(pwd, salt, nonce, testIterations);
 
       // Explicitly compute using pure JS engine
       const pwdBytes = new TextEncoder().encode(pwd);
       const saltBytes = hexToBuffer(salt);
       const nonceBytes = hexToBuffer(nonce);
-      const derivedKey = jsPbkdf2Sha256(pwdBytes, saltBytes, PBKDF2_ITERATIONS);
+      const derivedKey = await jsPbkdf2Sha256(pwdBytes, saltBytes, testIterations);
       const pureJsProof = bufferToHex(jsHmacSha256(derivedKey, nonceBytes));
 
       expect(publicProof).toBe(pureJsProof);
-      expect(await verifyAuthProof(pwd, salt, nonce, pureJsProof)).toBe(true);
+      expect(await verifyAuthProof(pwd, salt, nonce, pureJsProof, testIterations)).toBe(true);
     });
   });
 
@@ -224,6 +225,23 @@ describe("Phase 2: Crypto & ACL Guard Quality Gate", () => {
       unsubscribe();
       acl.updatePermissions({ allowAudio: false });
       expect(listenerCalls).toBe(1); // No new call after unsubscribe
+    });
+
+    it("should revoke all permissions and release stuck inputs on triggerPanic()", () => {
+      const acl = new ACLGuard({
+        allowInput: true,
+        allowClipboard: true,
+        allowFileTransfer: true,
+        allowAudio: true,
+      });
+
+      acl.triggerPanic();
+
+      const perms = acl.getPermissions();
+      expect(perms.allowInput).toBe(false);
+      expect(perms.allowClipboard).toBe(false);
+      expect(perms.allowFileTransfer).toBe(false);
+      expect(perms.allowAudio).toBe(false);
     });
   });
 });

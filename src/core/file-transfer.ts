@@ -1,4 +1,4 @@
-import { sha256 } from "./crypto";
+import { sha256, safeRandomUUID } from "./crypto";
 import type {
   FileMetadataPacket,
   FileChunkPacket,
@@ -82,7 +82,7 @@ export class FileSender {
   public async sendFile(file: File | { name: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> }): Promise<string> {
     this.isCancelled = false;
     const sanitizedName = sanitizeFileName(file.name);
-    const transferId = crypto.randomUUID();
+    const transferId = safeRandomUUID();
     const arrayBuf = await file.arrayBuffer();
     const totalBytes = arrayBuf.byteLength;
     const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE) || 1;

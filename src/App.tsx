@@ -11,6 +11,7 @@ import {
   generateSalt,
   computeAuthProof,
   verifyAuthProof,
+  safeRandomUUID,
 } from "./core/crypto";
 import {
   DEFAULT_ACL_PERMISSIONS,
@@ -23,12 +24,41 @@ import {
   type SignalingMessage,
 } from "./shared/protocol";
 
-const SIGNALING_URL =
-  typeof window !== "undefined" && window.location.hostname
-    ? `ws://${window.location.hostname}:4000`
-    : "ws://localhost:4000";
+function getInitialSignalingUrl(): string {
+  if (typeof window === "undefined") return "ws://localhost:4000";
+
+  try {
+    const saved = localStorage.getItem("omnidesk_signaling_url");
+    if (saved) return saved;
+  } catch {}
+
+  const loc = window.location;
+  const isLocalOrLan =
+    loc.hostname === "localhost" ||
+    loc.hostname === "127.0.0.1" ||
+    loc.hostname.startsWith("192.168.") ||
+    loc.hostname.startsWith("10.") ||
+    loc.hostname.startsWith("172.");
+
+  if (isLocalOrLan) {
+    return `ws://${loc.hostname}:4000`;
+  }
+
+  return loc.protocol === "https:"
+    ? `wss://${loc.hostname}:4000`
+    : `ws://${loc.hostname}:4000`;
+}
 
 export const App: React.FC = () => {
+  const [signalingUrl, setSignalingUrl] = useState<string>(getInitialSignalingUrl);
+
+  const handleUpdateSignalingUrl = useCallback((url: string) => {
+    setSignalingUrl(url);
+    try {
+      localStorage.setItem("omnidesk_signaling_url", url);
+    } catch {}
+  }, []);
+
   // Device & Host State (synchronously loaded from storage to maintain ID stability)
   const [deviceId, setDeviceId] = useState<string>(() => {
     if (typeof localStorage !== "undefined") {
@@ -261,8 +291,9 @@ export const App: React.FC = () => {
     function connect() {
       if (!isMounted) return;
 
-      const ws = new WebSocket(SIGNALING_URL);
-      wsRef.current = ws;
+      try {
+        const ws = new WebSocket(signalingUrl);
+        wsRef.current = ws;
 
       ws.onopen = () => {
         if (!isMounted) return;
@@ -414,9 +445,17 @@ export const App: React.FC = () => {
         reconnectTimer = setTimeout(connect, 3000);
       };
 
-      ws.onerror = () => {
-        ws.close();
-      };
+        ws.onerror = () => {
+          try {
+            ws.close();
+          } catch {}
+        };
+      } catch (err) {
+        console.warn("[Signaling] WebSocket initialization exception:", err);
+        if (!isMounted) return;
+        setIsSignalingOnline(false);
+        reconnectTimer = setTimeout(connect, 4000);
+      }
     }
 
     connect();
@@ -424,9 +463,11 @@ export const App: React.FC = () => {
     return () => {
       isMounted = false;
       clearTimeout(reconnectTimer);
-      wsRef.current?.close();
+      try {
+        wsRef.current?.close();
+      } catch {}
     };
-  }, [deviceName, sendSignaling]);
+  }, [signalingUrl, deviceName, sendSignaling]);
 
   // Client Initiates Connection
   const handleConnect = (targetRaw: string, password?: string) => {
@@ -532,7 +573,7 @@ export const App: React.FC = () => {
   const handleSendChatMessage = (text: string) => {
     const packet: ChatMessagePacket = {
       kind: "chat-message",
-      id: crypto.randomUUID(),
+      id: safeRandomUUID(),
       sender: deviceName,
       text,
       timestamp: Date.now(),
@@ -626,6 +667,8 @@ export const App: React.FC = () => {
           isConnecting={isConnecting}
           useSyntheticStream={useSyntheticStream}
           onToggleSyntheticStream={handleToggleSyntheticStream}
+          signalingUrl={signalingUrl}
+          onUpdateSignalingUrl={handleUpdateSignalingUrl}
         />
       )}
 

@@ -16,7 +16,8 @@ export default defineConfig({
     host: true,
   },
   build: {
-    target: "esnext",
+    target: ["chrome100", "edge100", "firefox100", "safari13"],
+    cssTarget: "chrome100",
     sourcemap: true,
   },
 });

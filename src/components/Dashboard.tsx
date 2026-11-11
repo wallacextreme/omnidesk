@@ -43,6 +43,8 @@ interface DashboardProps {
   isConnecting: boolean;
   useSyntheticStream?: boolean;
   onToggleSyntheticStream?: (enabled: boolean) => void;
+  signalingUrl?: string;
+  onUpdateSignalingUrl?: (url: string) => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
@@ -59,6 +61,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   isConnecting,
   useSyntheticStream = false,
   onToggleSyntheticStream,
+  signalingUrl,
+  onUpdateSignalingUrl,
 }) => {
   const [remoteInput, setRemoteInput] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -99,23 +103,51 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         </div>
 
-        {/* Signaling Status Badge */}
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 text-xs">
-          {isSignalingOnline ? (
-            <>
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="text-slate-300 font-medium">Servidor de Sinalização Online</span>
-            </>
-          ) : (
-            <>
-              <span className="w-2 h-2 rounded-full bg-rose-400" />
-              <WifiOff className="w-3.5 h-3.5 text-rose-400" />
-              <span className="text-rose-300 font-medium">Desconectado</span>
-            </>
-          )}
+        {/* Signaling Status Badge & Config */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => {
+              const current = signalingUrl || (typeof window !== "undefined" ? `ws://${window.location.hostname}:4000` : "ws://localhost:4000");
+              const next = prompt(
+                "Configurar Endereço do Servidor de Sinalização (WebSocket):\nExemplo para 2 PCs na mesma rede: ws://192.168.1.138:4000\nExemplo local: ws://localhost:4000",
+                current
+              );
+              if (next && onUpdateSignalingUrl) {
+                onUpdateSignalingUrl(next.trim());
+              }
+            }}
+            title="Clique para configurar o IP do servidor de sinalização"
+            className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 hover:border-slate-700 text-xs transition-colors cursor-pointer"
+          >
+            {isSignalingOnline ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="text-slate-300 font-medium">Sinalização Online</span>
+              </>
+            ) : (
+              <>
+                <span className="w-2 h-2 rounded-full bg-rose-400" />
+                <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                <span className="text-rose-300 font-medium">Desconectado (Alterar IP)</span>
+              </>
+            )}
+          </button>
         </div>
       </header>
+
+      {/* Disconnected / HTTPS LAN Guidance Banner */}
+      {!isSignalingOnline && (
+        <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-start gap-3">
+          <span className="text-base leading-none">⚠️</span>
+          <div>
+            <p className="font-semibold mb-1">Servidor de Sinalização Desconectado</p>
+            <p className="text-slate-300 leading-relaxed">
+              • Se estiver conectando dois computadores reais (ex: <strong>Windows 7</strong> e <strong>Windows 10/11</strong> na mesma rede local): certifique-se de que o servidor está rodando (<code>bun run server</code>) e acesse diretamente pelo IP local: <code className="bg-slate-950 px-1.5 py-0.5 rounded text-amber-200">http://192.168.1.138:5173</code> (para evitar o bloqueio de Mixed Content do Chrome em páginas HTTPS).
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Main Grid: 2 Columns */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">

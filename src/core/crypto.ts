@@ -120,6 +120,23 @@ export async function computeAuthProof(
 }
 
 /**
+ * Generates a cryptographically secure UUIDv4 with safe fallback for older browsers
+ * and non-secure HTTP contexts (e.g. LAN IP testing where crypto.randomUUID is undefined).
+ */
+export function safeRandomUUID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    try {
+      return crypto.randomUUID();
+    } catch {}
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/**
  * Verifies the provided proof against the password and challenge parameters in constant time.
  */
 export async function verifyAuthProof(

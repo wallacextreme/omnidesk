@@ -26,10 +26,17 @@ export interface WebRTCManagerCallbacks {
 
 export const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
+    {
+      urls: [
+        "stun:stun.l.google.com:19302",
+        "stun:stun.cloudflare.com:3478",
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
   ],
   iceCandidatePoolSize: 4,
 };
@@ -39,6 +46,8 @@ export class WebRTCManager {
   private controlChannel: RTCDataChannel | null = null;
   private transferChannel: RTCDataChannel | null = null;
   private localStream: MediaStream | null = null;
+  private fallbackRemoteStream: MediaStream | null = null;
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
   private callbacks: WebRTCManagerCallbacks;
   private statsInterval: ReturnType<typeof setInterval> | null = null;
   private lastBytesReceived = 0;
@@ -48,7 +57,7 @@ export class WebRTCManager {
     this.callbacks = callbacks;
   }
 
-  public async initializeAsHost(): Promise<void> {
+  public async initializeAsHost(providedStream?: MediaStream): Promise<void> {
     this.close();
     this.pc = new RTCPeerConnection(RTC_CONFIG);
     this.setupPeerConnectionEvents();
@@ -65,9 +74,9 @@ export class WebRTCManager {
     });
     this.setupTransferChannel(this.transferChannel);
 
-    // Capture screen track
+    // Capture or attach screen track
     try {
-      this.localStream = await nativeBridge.captureScreen();
+      this.localStream = providedStream || (await nativeBridge.captureScreen());
       for (const track of this.localStream.getTracks()) {
         this.pc.addTrack(track, this.localStream);
         track.onended = () => {
@@ -77,7 +86,7 @@ export class WebRTCManager {
       }
       this.prioritizeLightweightCodecs();
     } catch (err) {
-      console.error("[WebRTCManager] Failed to capture screen for host:", err);
+      console.error("[WebRTCManager] Failed to attach screen for host:", err);
       this.close();
       throw err;
     }
@@ -94,6 +103,24 @@ export class WebRTCManager {
     }
 
     this.startTelemetryPolling();
+  }
+
+  public addLocalStream(stream: MediaStream): void {
+    this.localStream = stream;
+    if (this.pc) {
+      for (const track of stream.getTracks()) {
+        try {
+          this.pc.addTrack(track, stream);
+          track.onended = () => {
+            console.info("[WebRTCManager] Local screen track ended by user");
+            this.callbacks.onConnectionStateChange?.("closed");
+          };
+        } catch (err) {
+          console.warn("[WebRTCManager] Error adding track to PC:", err);
+        }
+      }
+      this.prioritizeLightweightCodecs();
+    }
   }
 
   public async initializeAsClient(): Promise<void> {
@@ -134,6 +161,7 @@ export class WebRTCManager {
     switch (payload.kind) {
       case "offer": {
         await this.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: payload.sdp }));
+        await this.drainPendingIceCandidates();
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
         if (answer.sdp) {
@@ -147,32 +175,52 @@ export class WebRTCManager {
 
       case "answer": {
         await this.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: payload.sdp }));
+        await this.drainPendingIceCandidates();
         break;
       }
 
       case "ice-candidate": {
-        try {
-          const init: RTCIceCandidateInit = {
-            candidate: payload.candidate.candidate,
-          };
-          if (payload.candidate.sdpMid !== undefined) {
-            init.sdpMid = payload.candidate.sdpMid;
+        const init: RTCIceCandidateInit = {
+          candidate: payload.candidate.candidate,
+        };
+        if (payload.candidate.sdpMid !== undefined) {
+          init.sdpMid = payload.candidate.sdpMid;
+        }
+        if (payload.candidate.sdpMLineIndex !== undefined) {
+          init.sdpMLineIndex = payload.candidate.sdpMLineIndex;
+        }
+        if (payload.candidate.usernameFragment !== undefined) {
+          init.usernameFragment = payload.candidate.usernameFragment;
+        }
+
+        if (!this.pc.remoteDescription) {
+          this.pendingIceCandidates.push(init);
+        } else {
+          try {
+            await this.pc.addIceCandidate(new RTCIceCandidate(init));
+          } catch (err) {
+            console.warn("[WebRTCManager] Failed to add ICE candidate:", err);
           }
-          if (payload.candidate.sdpMLineIndex !== undefined) {
-            init.sdpMLineIndex = payload.candidate.sdpMLineIndex;
-          }
-          if (payload.candidate.usernameFragment !== undefined) {
-            init.usernameFragment = payload.candidate.usernameFragment;
-          }
-          await this.pc.addIceCandidate(new RTCIceCandidate(init));
-        } catch (err) {
-          console.warn("[WebRTCManager] Failed to add ICE candidate:", err);
         }
         break;
       }
 
       default: {
         const _exhaustive: never = payload;
+      }
+    }
+  }
+
+  private async drainPendingIceCandidates(): Promise<void> {
+    if (!this.pc || !this.pc.remoteDescription) return;
+    while (this.pendingIceCandidates.length > 0) {
+      const candidateInit = this.pendingIceCandidates.shift();
+      if (candidateInit) {
+        try {
+          await this.pc.addIceCandidate(new RTCIceCandidate(candidateInit));
+        } catch (err) {
+          console.warn("[WebRTCManager] Error adding queued ICE candidate:", err);
+        }
       }
     }
   }
@@ -232,14 +280,25 @@ export class WebRTCManager {
     }
     if (this.localStream) {
       for (const track of this.localStream.getTracks()) {
-        track.stop();
+        try {
+          track.stop();
+        } catch {}
       }
       this.localStream = null;
+    }
+    if (this.fallbackRemoteStream) {
+      for (const track of this.fallbackRemoteStream.getTracks()) {
+        try {
+          track.stop();
+        } catch {}
+      }
+      this.fallbackRemoteStream = null;
     }
     if (this.pc) {
       this.pc.close();
       this.pc = null;
     }
+    this.pendingIceCandidates = [];
   }
 
   private prioritizeLightweightCodecs(): void {
@@ -302,14 +361,38 @@ export class WebRTCManager {
     };
 
     this.pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        this.callbacks.onRemoteStream?.(event.streams[0]);
+      let stream = event.streams && event.streams[0];
+      if (!stream) {
+        if (!this.fallbackRemoteStream) {
+          this.fallbackRemoteStream = new MediaStream();
+        }
+        this.fallbackRemoteStream.addTrack(event.track);
+        stream = this.fallbackRemoteStream;
       }
+      this.callbacks.onRemoteStream?.(stream);
     };
 
     this.pc.onconnectionstatechange = () => {
       if (this.pc) {
         this.callbacks.onConnectionStateChange?.(this.pc.connectionState);
+      }
+    };
+
+    this.pc.onnegotiationneeded = async () => {
+      try {
+        if (!this.pc) return;
+        if (this.pc.signalingState === "stable") {
+          const offer = await this.pc.createOffer();
+          await this.pc.setLocalDescription(offer);
+          if (offer.sdp) {
+            this.callbacks.onSignal({
+              kind: "offer",
+              sdp: offer.sdp,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("[WebRTCManager] onnegotiationneeded error:", err);
       }
     };
   }
@@ -350,7 +433,7 @@ export class WebRTCManager {
       try {
         const stats = await this.pc.getStats();
         let rttMs = 0;
-        let fps = 60;
+        let fps = 0;
         let bytesReceived = 0;
         let packetsLost = 0;
         let totalPackets = 0;
@@ -392,8 +475,8 @@ export class WebRTCManager {
           totalPackets > 0 ? Math.min(100, Math.round((packetsLost / totalPackets) * 100)) : 0;
 
         this.callbacks.onTelemetry?.({
-          rttMs: rttMs || 15,
-          fps: fps || 60,
+          rttMs,
+          fps,
           bitrateKbps,
           packetLossPercent,
         });

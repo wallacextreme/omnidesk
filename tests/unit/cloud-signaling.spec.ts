@@ -74,5 +74,53 @@ describe("Phase 4: Hybrid Cloud Signaling & Windows 7 Zero-Config", () => {
       expect(typeof manager.close).toBe("function");
       manager.close();
     });
+
+    it("should configure OpenRelay TURN servers for symmetric NAT penetration", () => {
+      const { RTC_CONFIG } = require("../../src/core/webrtc-manager");
+      expect(RTC_CONFIG).toBeDefined();
+      expect(RTC_CONFIG.iceServers).toBeDefined();
+      expect(RTC_CONFIG.iceServers.length).toBeGreaterThan(0);
+
+      const serverUrls = RTC_CONFIG.iceServers[0].urls;
+      const turnUrls = serverUrls.filter((u: string) => u.startsWith("turn:"));
+      expect(turnUrls.length).toBeGreaterThanOrEqual(3);
+      expect(turnUrls.some((u: string) => u.includes(":80"))).toBe(true);
+      expect(turnUrls.some((u: string) => u.includes(":443"))).toBe(true);
+      expect(turnUrls.some((u: string) => u.includes("transport=tcp"))).toBe(true);
+      expect(RTC_CONFIG.iceServers[0].username).toBe("openrelayproject");
+      expect(RTC_CONFIG.iceServers[0].credential).toBe("openrelayproject");
+    });
+  });
+
+  describe("4. AnyDesk-Style WSS Frame Relay Engine", () => {
+    it("should strictly validate video-frame signaling packets", () => {
+      const { VideoFrameMsgSchema, parseSignalingMessage } = require("../../src/shared/protocol");
+      const validFrame = {
+        type: "video-frame",
+        targetId: "123456789",
+        senderId: "987654321",
+        frameDataUrl: "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+        width: 960,
+        height: 540,
+        timestamp: Date.now(),
+      };
+
+      const parsed = VideoFrameMsgSchema.safeParse(validFrame);
+      expect(parsed.success).toBe(true);
+
+      const signaled = parseSignalingMessage(validFrame);
+      expect(signaled).not.toBeNull();
+      expect(signaled?.type).toBe("video-frame");
+    });
+
+    it("should instantiate and terminate FrameRelayHost safely", () => {
+      const { FrameRelayHost } = require("../../src/core/frame-relay");
+      const fakeStream = {} as MediaStream;
+      const relay = new FrameRelayHost(fakeStream, () => {});
+      expect(relay).toBeDefined();
+      expect(typeof relay.start).toBe("function");
+      expect(typeof relay.stop).toBe("function");
+      relay.stop();
+    });
   });
 });

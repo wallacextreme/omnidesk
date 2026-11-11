@@ -19,6 +19,7 @@ import type { ACLPermissions } from "../shared/protocol";
 
 interface SessionHUDProps {
   telemetry: TelemetryStats;
+  isFallbackRelay?: boolean;
   permissions: ACLPermissions;
   onToggleInputBlock: () => void;
   onSendSpecialKey: (action: "ctrl-alt-del" | "lock" | "esc") => void;
@@ -35,6 +36,7 @@ interface SessionHUDProps {
 
 export const SessionHUD: React.FC<SessionHUDProps> = ({
   telemetry,
+  isFallbackRelay = false,
   permissions,
   onToggleInputBlock,
   onSendSpecialKey,
@@ -85,25 +87,39 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
           onClick={() => setIsCollapsed(false)}
           className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900/90 border border-slate-700 backdrop-blur-md shadow-2xl text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition"
         >
-          <span className={`w-2 h-2 rounded-full ${dotColor}`} />
-          <span>{telemetry.rttMs} ms</span>
+          <span className={`w-2 h-2 rounded-full ${isFallbackRelay ? "bg-cyan-400" : dotColor}`} />
+          <span>{isFallbackRelay ? "WSS Relay" : telemetry.fps === 0 ? "Conectando..." : `${telemetry.rttMs} ms`}</span>
           <ChevronDown className="w-3.5 h-3.5" />
         </button>
       ) : (
         <div className="flex items-center gap-2 p-1.5 rounded-2xl bg-slate-900/90 border border-slate-800/90 backdrop-blur-xl shadow-2xl shadow-black/80">
           {/* Telemetry Indicator */}
-          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>
-            <span className={`w-2 h-2 rounded-full ${dotColor} animate-pulse`} />
-            <span>{telemetry.rttMs}ms</span>
-            <span className="text-slate-500">|</span>
-            <span className="text-slate-300">{telemetry.fps} FPS</span>
-            {telemetry.bitrateKbps > 0 && (
-              <>
-                <span className="text-slate-500">|</span>
-                <span className="text-slate-400">{telemetry.bitrateKbps} kbps</span>
-              </>
-            )}
-          </div>
+          {isFallbackRelay ? (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium text-cyan-400 bg-cyan-500/10 border-cyan-500/20">
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+              <span>WSS Relay</span>
+              <span className="text-slate-500">|</span>
+              <span className="text-slate-300">~5 FPS</span>
+            </div>
+          ) : telemetry.fps === 0 && telemetry.bitrateKbps === 0 ? (
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>
+              <span className={`w-2 h-2 rounded-full ${dotColor} animate-pulse`} />
+              <span>Conectando...</span>
+            </div>
+          ) : (
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>
+              <span className={`w-2 h-2 rounded-full ${dotColor} animate-pulse`} />
+              <span>{telemetry.rttMs}ms</span>
+              <span className="text-slate-500">|</span>
+              <span className="text-slate-300">{telemetry.fps} FPS</span>
+              {telemetry.bitrateKbps > 0 && (
+                <>
+                  <span className="text-slate-500">|</span>
+                  <span className="text-slate-400">{telemetry.bitrateKbps} kbps</span>
+                </>
+              )}
+            </div>
+          )}
 
           <div className="h-5 w-px bg-slate-800" />
 

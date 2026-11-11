@@ -395,6 +395,17 @@ export class SignalingServer {
         break;
       }
 
+      case "video-frame": {
+        if (msg.targetId) {
+          const targetNormalized = normalizeDeviceId(msg.targetId);
+          const targetWs = this.hosts.get(targetNormalized);
+          if (targetWs) {
+            this.sendJson(targetWs, msg);
+          }
+        }
+        break;
+      }
+
       default: {
         this.sendJson(ws, {
           type: "error",

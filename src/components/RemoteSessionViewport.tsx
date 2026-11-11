@@ -10,6 +10,7 @@ import type { FileTransferProgress } from "../core/file-transfer";
 
 interface RemoteSessionViewportProps {
   remoteStream: MediaStream | null;
+  fallbackFrame?: string | null;
   telemetry: TelemetryStats;
   permissions: ACLPermissions;
   onSendInputPacket: (packet: InputPacket) => void;
@@ -27,6 +28,7 @@ interface RemoteSessionViewportProps {
 
 export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   remoteStream,
+  fallbackFrame,
   telemetry,
   permissions,
   onSendInputPacket,
@@ -50,6 +52,15 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   const [quality, setQuality] = useState<"performance" | "balanced" | "original">("balanced");
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [showMirrorTip, setShowMirrorTip] = useState(true);
+  const [isWebRtcPlaying, setIsWebRtcPlaying] = useState(false);
+  const [hasReceivedFirstFrame, setHasReceivedFirstFrame] = useState(false);
+
+  // Monitor arrival of fallback WSS frame
+  useEffect(() => {
+    if (fallbackFrame) {
+      setHasReceivedFirstFrame(true);
+    }
+  }, [fallbackFrame]);
 
   // Attach stream to video element
   useEffect(() => {
@@ -57,9 +68,13 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     if (video && remoteStream) {
       video.srcObject = remoteStream;
       video.muted = true; // Crucial to prevent browser blocking autoplay
-      video.play().catch((err) => {
-        console.warn("[RemoteViewport] Auto-play video error:", err);
-      });
+      video.play()
+        .then(() => {
+          setIsWebRtcPlaying(true);
+        })
+        .catch((err) => {
+          console.warn("[RemoteViewport] Auto-play video error:", err);
+        });
     }
   }, [remoteStream]);
 
@@ -156,6 +171,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       {/* Session Top HUD */}
       <SessionHUD
         telemetry={telemetry}
+        isFallbackRelay={!isWebRtcPlaying && Boolean(fallbackFrame)}
         permissions={permissions}
         onToggleInputBlock={onToggleInputBlock}
         onSendSpecialKey={onSendSpecialKey}
@@ -171,7 +187,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       />
 
       {/* Waiting for Host video stream loader (unblurred, clear instructions) */}
-      {!remoteStream && (
+      {!isWebRtcPlaying && !fallbackFrame && !hasReceivedFirstFrame && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-300 z-10 pointer-events-none select-none">
           <div className="w-12 h-12 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin mb-4" />
           <p className="text-sm font-semibold text-white mb-1">Aguardando transmissão de vídeo do Host...</p>
@@ -196,13 +212,30 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         </div>
       )}
 
-      {/* Hardware Accelerated Video Stream */}
+      {/* Fallback Image Frame (Rendered when WebRTC is negotiating/slow or on legacy systems) */}
+      {!isWebRtcPlaying && fallbackFrame && (
+        <img
+          src={fallbackFrame}
+          alt="Transmissão Remota em Tempo Real"
+          className="w-full h-full object-contain pointer-events-none select-none"
+        />
+      )}
+
+      {/* Hardware Accelerated Video Stream (Always mounted) */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
-        className="w-full h-full object-contain pointer-events-none"
+        onPlaying={() => setIsWebRtcPlaying(true)}
+        onLoadedData={() => {
+          if (videoRef.current && videoRef.current.videoWidth > 0) {
+            setIsWebRtcPlaying(true);
+          }
+        }}
+        className={`w-full h-full object-contain pointer-events-none transition-opacity duration-300 ${
+          isWebRtcPlaying ? "opacity-100" : "opacity-0 absolute inset-0"
+        }`}
       />
 
       {/* Transparent pointer capture overlay */}

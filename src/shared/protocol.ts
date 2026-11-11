@@ -181,6 +181,19 @@ export const SessionCloseMsgSchema = z.object({
 });
 export type SessionCloseMsg = z.infer<typeof SessionCloseMsgSchema>;
 
+// Fallback Video Relay: Host -> WSS Relay / DataChannel -> Client (AnyDesk Fallback)
+export const VideoFrameMsgSchema = z.object({
+  type: z.literal("video-frame"),
+  targetId: z.string().optional(),
+  senderId: z.string().optional(),
+  fromId: z.string().optional(),
+  frameDataUrl: z.string(),
+  width: z.number(),
+  height: z.number(),
+  timestamp: z.number(),
+});
+export type VideoFrameMsg = z.infer<typeof VideoFrameMsgSchema>;
+
 // Heartbeat & Errors
 export const PingMsgSchema = z.object({ type: z.literal("ping") });
 export const PongMsgSchema = z.object({ type: z.literal("pong") });
@@ -205,6 +218,7 @@ export const SignalingMessageSchema = z.discriminatedUnion("type", [
   SessionRejectedMsgSchema,
   WebRTCSignalMsgSchema,
   SessionCloseMsgSchema,
+  VideoFrameMsgSchema,
   PingMsgSchema,
   PongMsgSchema,
   ErrorMsgSchema,

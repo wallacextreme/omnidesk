@@ -9,6 +9,7 @@ import { WebRTCManager, type TelemetryStats } from "./core/webrtc-manager";
 import { ACLGuard } from "./core/acl-guard";
 import { FileSender, FileReceiver, type FileTransferProgress } from "./core/file-transfer";
 import { nativeBridge } from "./core/native-bridge";
+import { FrameRelayHost } from "./core/frame-relay";
 import {
   generateNonce,
   generateSalt,
@@ -120,12 +121,13 @@ export const App: React.FC = () => {
 
   // Telemetry & Permissions
   const [telemetry, setTelemetry] = useState<TelemetryStats>({
-    rttMs: 15,
-    fps: 60,
-    bitrateKbps: 2400,
+    rttMs: 0,
+    fps: 0,
+    bitrateKbps: 0,
     packetLossPercent: 0,
   });
   const [activeAcl, setActiveAcl] = useState<ACLPermissions>({ ...DEFAULT_ACL_PERMISSIONS });
+  const [fallbackFrame, setFallbackFrame] = useState<string | null>(null);
 
   // Chat & File Transfer State
   const [chatMessages, setChatMessages] = useState<ChatMessagePacket[]>([]);
@@ -161,6 +163,8 @@ export const App: React.FC = () => {
   const signalingClientRef = useRef<SignalingClient | null>(null);
   const hostSecretRef = useRef<string>(getOrCreateHostSecret());
   const webrtcRef = useRef<WebRTCManager | null>(null);
+  const frameRelayRef = useRef<FrameRelayHost | null>(null);
+  const pendingSignalsRef = useRef<any[]>([]);
   const aclGuardRef = useRef<ACLGuard>(new ACLGuard(DEFAULT_ACL_PERMISSIONS));
   const fileSenderRef = useRef<FileSender | null>(null);
   const fileReceiverRef = useRef<FileReceiver | null>(null);
@@ -214,9 +218,30 @@ export const App: React.FC = () => {
     signalingClientRef.current?.switchMode(mode, customUrl);
   }, []);
 
+  // Instant WSS Frame Relay (AnyDesk fallback)
+  const startFrameRelay = useCallback(
+    (stream: MediaStream, targetPeerId: string) => {
+      frameRelayRef.current?.stop();
+      const relay = new FrameRelayHost(stream, (dataUrl, w, h) => {
+        sendSignaling({
+          type: "video-frame",
+          targetId: targetPeerId,
+          senderId: deviceIdRef.current,
+          frameDataUrl: dataUrl,
+          width: w,
+          height: h,
+          timestamp: Date.now(),
+        });
+      });
+      relay.start(200, 960);
+      frameRelayRef.current = relay;
+    },
+    [sendSignaling]
+  );
+
   // WebRTC Setup Helper
   const setupWebRTC = useCallback(
-    async (role: "host" | "client", targetId: string) => {
+    async (role: "host" | "client", targetId: string, providedStream?: MediaStream) => {
       if (webrtcRef.current) {
         webrtcRef.current.close();
       }
@@ -299,9 +324,15 @@ export const App: React.FC = () => {
       });
 
       if (role === "host") {
-        await manager.initializeAsHost();
+        await manager.initializeAsHost(providedStream);
       } else {
         await manager.initializeAsClient();
+      }
+
+      // Drain any queued signals received before webrtc initialization
+      while (pendingSignalsRef.current.length > 0) {
+        const pending = pendingSignalsRef.current.shift()!;
+        await manager.handleRemoteSignal(pending);
       }
 
       setSessionRole(role);
@@ -409,7 +440,9 @@ export const App: React.FC = () => {
 
                   if (isValid) {
                     try {
-                      await setupWebRTCRef.current("host", msg.senderId);
+                      const stream = await nativeBridge.captureScreen();
+                      startFrameRelay(stream, msg.senderId);
+                      await setupWebRTCRef.current("host", msg.senderId, stream);
                       sendSignaling({
                         type: "session-accepted",
                         targetId: msg.senderId,
@@ -451,9 +484,16 @@ export const App: React.FC = () => {
                 break;
               }
 
+              case "video-frame": {
+                setFallbackFrame(msg.frameDataUrl);
+                break;
+              }
+
               case "webrtc-signal": {
                 if (webrtcRef.current) {
                   await webrtcRef.current.handleRemoteSignal(msg.signal);
+                } else {
+                  pendingSignalsRef.current.push(msg.signal);
                 }
                 break;
               }
@@ -535,8 +575,16 @@ export const App: React.FC = () => {
     setActiveAcl(customPermissions);
 
     try {
-      await setupWebRTC("host", client);
+      // 1. Capture screen FIRST
+      const stream = await nativeBridge.captureScreen();
 
+      // 2. Start instant WSS Frame Relay (AnyDesk style guaranteed video)
+      startFrameRelay(stream, client);
+
+      // 3. Initialize WebRTC on Host with pre-captured stream
+      await setupWebRTC("host", client, stream);
+
+      // 4. Notify client that session is accepted
       sendSignaling({
         type: "session-accepted",
         targetId: client,
@@ -642,6 +690,12 @@ export const App: React.FC = () => {
       });
     }
 
+    frameRelayRef.current?.stop();
+    frameRelayRef.current = null;
+    setFallbackFrame(null);
+    pendingSignalsRef.current = [];
+    nativeBridge.releaseAllInputs();
+
     webrtcRef.current?.close();
     webrtcRef.current = null;
     fileSenderRef.current = null;
@@ -663,6 +717,7 @@ export const App: React.FC = () => {
       {sessionRole === "client" ? (
         <RemoteSessionViewport
           remoteStream={remoteStream}
+          fallbackFrame={fallbackFrame}
           telemetry={telemetry}
           permissions={activeAcl}
           onSendInputPacket={handleSendInputPacket}

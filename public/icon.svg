@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0e1726" />
+      <stop offset="100%" stop-color="#060911" />
+    </linearGradient>
+    <linearGradient id="cyan-glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22d3ee" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)" />
+  <rect x="24" y="24" width="464" height="464" rx="100" fill="none" stroke="#1e293b" stroke-width="8" />
+  
+  <!-- Monitor frame -->
+  <rect x="80" y="96" width="352" height="240" rx="24" fill="#0f172a" stroke="url(#cyan-glow)" stroke-width="12" />
+  
+  <!-- Screen grid pulse -->
+  <path d="M120 216 L200 216 L230 156 L282 276 L312 216 L392 216" fill="none" stroke="#38bdf8" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+  
+  <!-- Stand -->
+  <path d="M226 336 L216 400 L296 400 L286 336 Z" fill="#1e293b" />
+  <rect x="176" y="400" width="160" height="20" rx="10" fill="url(#cyan-glow)" />
+</svg>

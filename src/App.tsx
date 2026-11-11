@@ -2,6 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Dashboard, type RecentSession } from "./components/Dashboard";
 import { IncomingRequestModal } from "./components/IncomingRequestModal";
 import { RemoteSessionViewport } from "./components/RemoteSessionViewport";
+import { HostActiveSessionBar } from "./components/HostActiveSessionBar";
+import { ChatDrawer } from "./components/ChatDrawer";
+import { FileTransferDrawer } from "./components/FileTransferDrawer";
 import { WebRTCManager, type TelemetryStats } from "./core/webrtc-manager";
 import { ACLGuard } from "./core/acl-guard";
 import { FileSender, FileReceiver, type FileTransferProgress } from "./core/file-transfer";
@@ -106,12 +109,14 @@ export const App: React.FC = () => {
     hasUnattendedPassword: boolean;
   } | null>(null);
 
-  // Active Session State
+  // Active Session State: 'idle' = no session; 'host' = broadcasting this screen; 'client' = watching remote screen
   const [sessionActive, setSessionActive] = useState<boolean>(false);
-  const [sessionRole, setSessionRole] = useState<"host" | "client" | null>(null);
+  const [sessionRole, setSessionRole] = useState<"idle" | "host" | "client">("idle");
   const [remotePeerId, setRemotePeerId] = useState<string>("");
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [hostChatOpen, setHostChatOpen] = useState<boolean>(false);
+  const [hostFilesOpen, setHostFilesOpen] = useState<boolean>(false);
 
   // Telemetry & Permissions
   const [telemetry, setTelemetry] = useState<TelemetryStats>({
@@ -403,14 +408,23 @@ export const App: React.FC = () => {
                   );
 
                   if (isValid) {
-                    // Approved!
-                    sendSignaling({
-                      type: "session-accepted",
-                      targetId: msg.senderId,
-                      senderId: deviceIdRef.current,
-                      permissions: defaultAclRef.current,
-                    });
-                    await setupWebRTCRef.current("host", msg.senderId);
+                    try {
+                      await setupWebRTCRef.current("host", msg.senderId);
+                      sendSignaling({
+                        type: "session-accepted",
+                        targetId: msg.senderId,
+                        senderId: deviceIdRef.current,
+                        permissions: defaultAclRef.current,
+                      });
+                    } catch (err) {
+                      console.warn("[App] Host unattended screen capture failed:", err);
+                      sendSignaling({
+                        type: "session-rejected",
+                        targetId: msg.senderId,
+                        reason: "Captura de tela cancelada no Host.",
+                      });
+                      handleEndSession();
+                    }
                   } else {
                     sendSignaling({
                       type: "session-rejected",
@@ -520,14 +534,26 @@ export const App: React.FC = () => {
     aclGuardRef.current.setAll(customPermissions);
     setActiveAcl(customPermissions);
 
-    sendSignaling({
-      type: "session-accepted",
-      targetId: client,
-      senderId: deviceIdRef.current,
-      permissions: customPermissions,
-    });
+    try {
+      await setupWebRTC("host", client);
 
-    await setupWebRTC("host", client);
+      sendSignaling({
+        type: "session-accepted",
+        targetId: client,
+        senderId: deviceIdRef.current,
+        permissions: customPermissions,
+      });
+    } catch (err) {
+      console.warn("[App] Host failed to initialize screen broadcast:", err);
+      sendSignaling({
+        type: "session-rejected",
+        targetId: client,
+        senderId: deviceIdRef.current,
+        reason: "Captura de tela cancelada pelo Host ou não autorizada.",
+      });
+      handleEndSession();
+      alert("A captura de tela foi cancelada. A conexão não foi iniciada.");
+    }
   };
 
   // Host Rejects Connection via Modal
@@ -621,18 +647,20 @@ export const App: React.FC = () => {
     fileSenderRef.current = null;
     fileReceiverRef.current = null;
     setSessionActive(false);
-    setSessionRole(null);
+    setSessionRole("idle");
     setRemotePeerId("");
     setRemoteStream(null);
     setIsConnecting(false);
     setChatMessages([]);
     setActiveTransferProgress(null);
+    setHostChatOpen(false);
+    setHostFilesOpen(false);
   };
 
   return (
-    <div className="w-full min-h-screen bg-[#090d16] text-slate-100 flex flex-col justify-center">
-      {/* 1. Active Remote Session Viewport */}
-      {sessionActive ? (
+    <div className="w-full min-h-screen bg-[#090d16] text-slate-100 flex flex-col justify-start">
+      {/* 1. Client Viewport: Rendered ONLY on the computer watching/controlling remote screen */}
+      {sessionRole === "client" ? (
         <RemoteSessionViewport
           remoteStream={remoteStream}
           telemetry={telemetry}
@@ -647,36 +675,82 @@ export const App: React.FC = () => {
           activeTransferProgress={activeTransferProgress}
           onSendFile={handleSendFile}
           receivedFiles={receivedFiles}
-          isHost={sessionRole === "host"}
+          isHost={false}
         />
       ) : (
-        /* 2. Main AnyDesk Dashboard */
-        <Dashboard
-          deviceId={deviceId}
-          isSignalingOnline={isSignalingOnline}
-          signalingMode={signalingMode}
-          signalingStatus={signalingStatus}
-          onSwitchSignalingMode={handleSwitchSignalingMode}
-          unattendedPassword={unattendedPassword}
-          onUpdateUnattendedPassword={setUnattendedPassword}
-          defaultAcl={defaultAcl}
-          onUpdateDefaultAcl={(acl) => setDefaultAcl((prev) => ({ ...prev, ...acl }))}
-          onConnect={handleConnect}
-          recentSessions={recentSessions}
-          onToggleFavorite={(id) =>
-            setRecentSessions((prev) =>
-              prev.map((s) => (s.id === id ? { ...s, favorite: !s.favorite } : s))
-            )
-          }
-          onRemoveRecent={(id) =>
-            setRecentSessions((prev) => prev.filter((s) => s.id !== id))
-          }
-          isConnecting={isConnecting}
-          useSyntheticStream={useSyntheticStream}
-          onToggleSyntheticStream={handleToggleSyntheticStream}
-          signalingUrl={signalingUrl}
-          onUpdateSignalingUrl={handleUpdateSignalingUrl}
-        />
+        /* 2. Host & Idle Views: Host never renders RemoteSessionViewport to avoid black/blurred screen */
+        <div className="w-full min-h-screen flex flex-col justify-start">
+          {sessionRole === "host" && (
+            <HostActiveSessionBar
+              remotePeerId={remotePeerId}
+              telemetry={telemetry}
+              permissions={activeAcl}
+              onToggleInputBlock={handleToggleInputBlock}
+              onUpdatePermissions={(updates) => {
+                const next = { ...activeAcl, ...updates };
+                setActiveAcl(next);
+                aclGuardRef.current.updatePermissions(next);
+                webrtcRef.current?.sendControlPacket({
+                  kind: "acl-update",
+                  permissions: next,
+                });
+              }}
+              onToggleChat={() => setHostChatOpen(!hostChatOpen)}
+              onToggleFiles={() => setHostFilesOpen(!hostFilesOpen)}
+              onEndSession={handleEndSession}
+              unreadChatCount={chatMessages.length}
+            />
+          )}
+
+          <div className="flex-1 flex flex-col justify-center">
+            <Dashboard
+              deviceId={deviceId}
+              isSignalingOnline={isSignalingOnline}
+              signalingMode={signalingMode}
+              signalingStatus={signalingStatus}
+              onSwitchSignalingMode={handleSwitchSignalingMode}
+              unattendedPassword={unattendedPassword}
+              onUpdateUnattendedPassword={setUnattendedPassword}
+              defaultAcl={defaultAcl}
+              onUpdateDefaultAcl={(acl) => setDefaultAcl((prev) => ({ ...prev, ...acl }))}
+              onConnect={handleConnect}
+              recentSessions={recentSessions}
+              onToggleFavorite={(id) =>
+                setRecentSessions((prev) =>
+                  prev.map((s) => (s.id === id ? { ...s, favorite: !s.favorite } : s))
+                )
+              }
+              onRemoveRecent={(id) =>
+                setRecentSessions((prev) => prev.filter((s) => s.id !== id))
+              }
+              isConnecting={isConnecting}
+              useSyntheticStream={useSyntheticStream}
+              onToggleSyntheticStream={handleToggleSyntheticStream}
+              signalingUrl={signalingUrl}
+              onUpdateSignalingUrl={handleUpdateSignalingUrl}
+            />
+          </div>
+
+          {/* Host Drawers for Chat & File Transfer */}
+          {sessionRole === "host" && (
+            <>
+              <ChatDrawer
+                isOpen={hostChatOpen}
+                onClose={() => setHostChatOpen(false)}
+                messages={chatMessages}
+                onSendMessage={handleSendChatMessage}
+                localSenderName={deviceName}
+              />
+              <FileTransferDrawer
+                isOpen={hostFilesOpen}
+                onClose={() => setHostFilesOpen(false)}
+                activeProgress={activeTransferProgress}
+                onSendFile={handleSendFile}
+                receivedFiles={receivedFiles}
+              />
+            </>
+          )}
+        </div>
       )}
 
       {/* 3. Incoming Connection Request Modal */}

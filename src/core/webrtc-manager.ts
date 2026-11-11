@@ -70,10 +70,16 @@ export class WebRTCManager {
       this.localStream = await nativeBridge.captureScreen();
       for (const track of this.localStream.getTracks()) {
         this.pc.addTrack(track, this.localStream);
+        track.onended = () => {
+          console.info("[WebRTCManager] Local screen track ended by user");
+          this.callbacks.onConnectionStateChange?.("closed");
+        };
       }
       this.prioritizeLightweightCodecs();
     } catch (err) {
       console.error("[WebRTCManager] Failed to capture screen for host:", err);
+      this.close();
+      throw err;
     }
 
     // Create offer
@@ -94,6 +100,15 @@ export class WebRTCManager {
     this.close();
     this.pc = new RTCPeerConnection(RTC_CONFIG);
     this.setupPeerConnectionEvents();
+
+    // Explicitly add recvonly video transceiver so SDP offer/answer negotiates incoming host video stream
+    try {
+      if (typeof this.pc.addTransceiver === "function") {
+        this.pc.addTransceiver("video", { direction: "recvonly" });
+      }
+    } catch (err) {
+      console.warn("[WebRTCManager] addTransceiver video recvonly fallback:", err);
+    }
 
     // Client receives data channels created by host
     this.pc.ondatachannel = (event) => {

@@ -44,6 +44,16 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
     return () => clearInterval(timer);
   }, [onReject]);
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onReject("Solicitação cancelada pelo usuário (ESC).");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onReject]);
+
   const togglePerm = (key: keyof ACLPermissions) => {
     setPerms((prev) => ({
       ...prev,
@@ -54,7 +64,7 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
   return (
     <div
       data-testid="incoming-request-modal"
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 animate-fade-in"
     >
       <div className="w-full max-w-md bg-slate-900 border border-cyan-500/30 rounded-2xl p-6 shadow-2xl shadow-cyan-500/10 relative overflow-hidden">
         {/* Glowing top line */}

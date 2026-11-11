@@ -52,11 +52,11 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
     const hostAcceptBtn = pageHost.locator('[data-testid="accept-request-btn"]');
     await hostAcceptBtn.click();
 
-    // Both Host and Client transition into active session viewport
-    const hostViewport = pageHost.locator('[data-testid="remote-viewport"]');
+    // Host displays active broadcast bar, Client displays remote viewport
+    const hostActiveBar = pageHost.locator('[data-testid="host-active-bar"]');
     const clientViewport = pageClient.locator('[data-testid="remote-viewport"]');
 
-    await expect(hostViewport).toBeVisible({ timeout: 10000 });
+    await expect(hostActiveBar).toBeVisible({ timeout: 10000 });
     await expect(clientViewport).toBeVisible({ timeout: 10000 });
 
     // ========================================================

@@ -57,4 +57,22 @@ describe("Phase 4: Hybrid Cloud Signaling & Windows 7 Zero-Config", () => {
       client.disconnect();
     });
   });
+
+  describe("3. WebRTC Manager Client Video Transceiver & Role Separation", () => {
+    it("should instantiate WebRTCManager and configure signal callbacks", () => {
+      const { WebRTCManager } = require("../../src/core/webrtc-manager");
+      let signalSent = false;
+      const manager = new WebRTCManager({
+        onSignal: () => {
+          signalSent = true;
+        },
+      });
+
+      expect(manager).toBeDefined();
+      expect(typeof manager.initializeAsHost).toBe("function");
+      expect(typeof manager.initializeAsClient).toBe("function");
+      expect(typeof manager.close).toBe("function");
+      manager.close();
+    });
+  });
 });

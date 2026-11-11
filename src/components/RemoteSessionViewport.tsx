@@ -53,13 +53,34 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
 
   // Attach stream to video element
   useEffect(() => {
-    if (videoRef.current && remoteStream) {
-      videoRef.current.srcObject = remoteStream;
-      videoRef.current.play().catch((err) => {
+    const video = videoRef.current;
+    if (video && remoteStream) {
+      video.srcObject = remoteStream;
+      video.muted = true; // Crucial to prevent browser blocking autoplay
+      video.play().catch((err) => {
         console.warn("[RemoteViewport] Auto-play video error:", err);
       });
     }
   }, [remoteStream]);
+
+  // Global ESC key listener to safely exit session from anywhere
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (isChatOpen) {
+          setIsChatOpen(false);
+          return;
+        }
+        if (isFilesOpen) {
+          setIsFilesOpen(false);
+          return;
+        }
+        onEndSession();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onEndSession, isChatOpen, isFilesOpen]);
 
   // Setup 60fps video frame callback telemetry
   useEffect(() => {
@@ -122,6 +143,16 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       ref={containerRef}
       className="relative w-screen h-screen bg-black overflow-hidden flex items-center justify-center select-none cursor-default outline-none"
     >
+      {/* Fixed Emergency Escape Button - Always visible and clickable */}
+      <button
+        onClick={onEndSession}
+        className="fixed top-4 right-4 z-[9999] pointer-events-auto flex items-center gap-2 px-3.5 py-2 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white font-medium text-xs shadow-xl shadow-rose-950/50 border border-rose-400/30 transition-all cursor-pointer group"
+        title="Encerrar sessão e voltar ao painel (ESC)"
+      >
+        <X className="w-4 h-4 group-hover:rotate-90 transition-transform" />
+        <span>Encerrar (ESC)</span>
+      </button>
+
       {/* Session Top HUD */}
       <SessionHUD
         telemetry={telemetry}
@@ -139,9 +170,18 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         isHost={isHost}
       />
 
+      {/* Waiting for Host video stream loader (unblurred, clear instructions) */}
+      {!remoteStream && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-300 z-10 pointer-events-none select-none">
+          <div className="w-12 h-12 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin mb-4" />
+          <p className="text-sm font-semibold text-white mb-1">Aguardando transmissão de vídeo do Host...</p>
+          <p className="text-xs text-slate-400">Pressione ESC ou clique no botão acima a qualquer momento para cancelar.</p>
+        </div>
+      )}
+
       {/* Info Tip for Self-Testing to Explain the Droste / Mirror Effect */}
       {showMirrorTip && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-4 py-2 rounded-xl bg-slate-900/95 border border-cyan-500/30 text-xs text-slate-200 backdrop-blur-md shadow-2xl max-w-lg">
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-4 py-2 rounded-xl bg-slate-900/95 border border-cyan-500/30 text-xs text-slate-200 shadow-2xl max-w-lg">
           <Info className="w-4 h-4 text-cyan-400 shrink-0" />
           <span className="flex-1">
             <strong>Dica de Uso:</strong> Ao testar no mesmo computador, compartilhe uma <em>Janela Específica</em> ou use outro PC/celular para evitar o efeito de túnel de espelhos.

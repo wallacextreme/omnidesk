@@ -35,3 +35,12 @@
 .animate-pulse-ring {
   animation: pulse-ring 2s infinite ease-in-out;
 }
+
+@keyframes click-ripple {
+  0% { transform: scale(0.7); opacity: 0.9; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+.animate-click-ripple {
+  animation: click-ripple 0.24s cubic-bezier(0, 0, 0.2, 1) 1 forwards;
+}

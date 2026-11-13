@@ -445,6 +445,7 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
       const captureOverlay = pageClient.locator('[data-testid="remote-input-capture"]');
       await expect(captureOverlay).toBeVisible();
       await captureOverlay.click({ position: { x: 240, y: 180 } });
+      await expect(pageClient.locator('[data-testid="click-ripple"]')).toBeHidden({ timeout: 1500 });
       await pageClient.keyboard.press("KeyK");
 
       await expect

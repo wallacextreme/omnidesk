@@ -113,7 +113,18 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   const [showMirrorTip, setShowMirrorTip] = useState(true);
   const [showViewOnlyNotice, setShowViewOnlyNotice] = useState(true);
   const [clickRipple, setClickRipple] = useState<{ x: number; y: number; key: number } | null>(null);
+  const clickRippleSeqRef = useRef(0);
   const [isWebRtcPlaying, setIsWebRtcPlaying] = useState(false);
+
+  useEffect(() => {
+    if (!clickRipple) return;
+    const timer = window.setTimeout(() => {
+      setClickRipple(null);
+    }, 260);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [clickRipple]);
   const [hasReceivedFirstFrame, setHasReceivedFirstFrame] = useState(false);
 
   // Monitor arrival of fallback WSS frame
@@ -564,10 +575,11 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         onMouseLeave={() => setIsPointerOverVideo(false)}
         onMouseDown={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
+          clickRippleSeqRef.current += 1;
           setClickRipple({
             x: e.clientX - rect.left,
             y: e.clientY - rect.top,
-            key: Date.now(),
+            key: clickRippleSeqRef.current,
           });
         }}
         className={`absolute inset-0 z-[5] pointer-events-auto outline-none ${
@@ -579,12 +591,16 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         }`}
       />
 
-      {/* Brief visual click ripple so client sees immediate click capture feedback */}
+      {/* Brief single-shot visual click ripple so client sees immediate click feedback without lingering */}
       {clickRipple && (
         <div
           key={clickRipple.key}
-          style={{ left: clickRipple.x - 10, top: clickRipple.y - 10 }}
-          className="fixed w-5 h-5 rounded-full border-2 border-cyan-400/80 pointer-events-none z-[6] animate-ping"
+          data-testid="click-ripple"
+          style={{
+            left: clickRipple.x - 10,
+            top: clickRipple.y - 10,
+          }}
+          className="fixed w-5 h-5 rounded-full border-2 border-cyan-400/80 pointer-events-none z-[6] animate-click-ripple"
           onAnimationEnd={() => setClickRipple(null)}
         />
       )}

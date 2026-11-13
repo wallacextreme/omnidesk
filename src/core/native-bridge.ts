@@ -77,32 +77,72 @@ export class NativeBridge implements INativeBridge {
     );
   }
 
-  public async captureScreen(_monitorId?: string): Promise<MediaStream> {
+  private syntheticStreams = new WeakSet<MediaStream>();
+
+  public isSyntheticStream(stream: MediaStream | null | undefined): boolean {
+    return Boolean(stream && this.syntheticStreams.has(stream));
+  }
+
+  public async captureScreen(
+    _monitorId?: string,
+    options?: { allowSyntheticFallback?: boolean }
+  ): Promise<MediaStream> {
+    const allowSyntheticFallback = options?.allowSyntheticFallback ?? true;
+
     // If synthetic test stream is forced (e.g. testing on single machine without infinite mirror)
     if (this.forceSyntheticStream) {
-      return this.createSyntheticStream();
+      const synth = this.createSyntheticStream();
+      this.syntheticStreams.add(synth);
+      return synth;
     }
 
     // 1. In browser with getDisplayMedia support (Secure context HTTPS or localhost)
     if (this.hasNativeScreenCapture()) {
+      let stream: MediaStream | null = null;
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({
+        stream = await navigator.mediaDevices.getDisplayMedia({
           video: {
-            frameRate: { ideal: 60, max: 60 },
+            frameRate: { ideal: 30, max: 60 },
             displaySurface: "monitor",
           },
           audio: false,
         });
+      } catch (firstErr) {
+        const errName = firstErr instanceof DOMException ? firstErr.name : "";
+        // User explicitly cancelled or denied permission
+        if (errName === "NotAllowedError" || errName === "AbortError") {
+          if (!allowSyntheticFallback) {
+            throw firstErr;
+          }
+          console.warn(
+            "[NativeBridge] getDisplayMedia cancelled/denied by user, falling back to synthetic stream:",
+            firstErr
+          );
+        } else {
+          // Retry with minimal constraints for legacy Chrome 109 / Windows 7 GPU drivers
+          try {
+            stream = await navigator.mediaDevices.getDisplayMedia({
+              video: true,
+              audio: false,
+            });
+          } catch (retryErr) {
+            if (!allowSyntheticFallback) {
+              throw retryErr;
+            }
+            console.warn(
+              "[NativeBridge] getDisplayMedia minimal retry failed, falling back to synthetic stream:",
+              retryErr
+            );
+          }
+        }
+      }
 
-        // Set contentHint for ultra-low latency motion
+      if (stream) {
         const videoTrack = stream.getVideoTracks()[0];
         if (videoTrack && "contentHint" in videoTrack) {
           videoTrack.contentHint = "motion";
         }
-
         return stream;
-      } catch (err) {
-        console.warn("[NativeBridge] getDisplayMedia denied or cancelled by user, falling back to synthetic stream:", err);
       }
     } else {
       const isHttpLan =
@@ -114,18 +154,24 @@ export class NativeBridge implements INativeBridge {
       if (isHttpLan) {
         console.warn(
           "[NativeBridge] navigator.mediaDevices.getDisplayMedia is undefined in non-secure HTTP context.\n" +
-          "ℹ️ Para habilitar captura da tela real no Chrome via IP local (http://" + (window.location.host || "192.168.x.x") + "):\n" +
-          "1. Abra chrome://flags/#unsafely-treat-insecure-origin-as-secure no navegador.\n" +
-          "2. Adicione http://" + (window.location.host || "192.168.x.x") + " e selecione 'Enabled'.\n" +
-          "3. Reinicie o Chrome.\n" +
-          "Ou acesse via HTTPS oficial (https://omnidesk-remote.web.app).\n" +
-          "Fallback ativo: Transmitindo fluxo sintético (Canvas 60 FPS com telemetria)."
+            "Para habilitar captura da tela real no Chrome via IP local (http://" +
+            (window.location.host || "192.168.x.x") +
+            "):\n" +
+            "1. Abra chrome://flags/#unsafely-treat-insecure-origin-as-secure no navegador.\n" +
+            "2. Adicione http://" +
+            (window.location.host || "192.168.x.x") +
+            " e selecione 'Enabled'.\n" +
+            "3. Reinicie o Chrome.\n" +
+            "Ou acesse via HTTPS oficial (https://omnidesk-remote.web.app).\n" +
+            "Fallback ativo: Transmitindo fluxo sintético."
         );
       }
     }
 
-    // 2. Synthetic stream fallback for automated testing / headless environments / non-secure HTTP contexts
-    return this.createSyntheticStream();
+    // 2. Synthetic stream fallback for automated testing / headless environments / unattended mode
+    const synth = this.createSyntheticStream();
+    this.syntheticStreams.add(synth);
+    return synth;
   }
 
   public async injectInput(packet: InputPacket): Promise<boolean> {

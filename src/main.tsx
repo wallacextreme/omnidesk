@@ -19,8 +19,24 @@ if (rootElement) {
 // Register Progressive Web App (PWA) Service Worker safely
 if (typeof window !== "undefined" && "serviceWorker" in navigator && import.meta.env.PROD) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch((err) => {
-      console.warn("[PWA] Service worker registration failed:", err);
-    });
+    const hadController = Boolean(navigator.serviceWorker.controller);
+    let refreshed = false;
+    if (hadController) {
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!refreshed) {
+          refreshed = true;
+          window.location.reload();
+        }
+      });
+    }
+
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((reg) => {
+        reg.update().catch(() => {});
+      })
+      .catch((err) => {
+        console.warn("[PWA] Service worker registration failed:", err);
+      });
   });
 }

@@ -1,4 +1,4 @@
-const CACHE_NAME = "omnidesk-v1";
+const CACHE_NAME = "omnidesk-v2";
 const STATIC_ASSETS = ["/", "/index.html", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
@@ -22,36 +22,65 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
-  // Do not intercept WebSocket or non-GET requests
-  if (event.request.method !== "GET" || event.request.url.startsWith("ws")) {
+  // Do not intercept WebSocket, external origins, or non-GET requests
+  if (
+    event.request.method !== "GET" ||
+    event.request.url.startsWith("ws") ||
+    !event.request.url.startsWith(self.location.origin)
+  ) {
     return;
   }
 
+  const url = new URL(event.request.url);
+  const isHtmlOrManifest =
+    event.request.mode === "navigate" ||
+    url.pathname === "/" ||
+    url.pathname === "/index.html" ||
+    url.pathname === "/manifest.json";
+
+  if (isHtmlOrManifest) {
+    // Network-First for HTML/navigation so deploys take effect immediately
+    event.respondWith(
+      fetch(event.request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const responseToCache = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, responseToCache);
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => {
+          return caches.match(event.request).then((cached) => {
+            return (
+              cached ||
+              caches.match("/index.html") ||
+              new Response("Offline - Recurso indisponível", { status: 503 })
+            );
+          });
+        })
+    );
+    return;
+  }
+
+  // Cache-First for immutable hashed /assets/* files
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
       if (cachedResponse) {
         return cachedResponse;
       }
-      return fetch(event.request).then((networkResponse) => {
-        // Cache successful local GET requests
-        if (
-          networkResponse &&
-          networkResponse.status === 200 &&
-          event.request.url.startsWith(self.location.origin)
-        ) {
-          const responseToCache = networkResponse.clone();
-          caches.open(CACHE_NAME).then((cache) => {
-            cache.put(event.request, responseToCache);
-          });
-        }
-        return networkResponse;
-      }).catch(() => {
-        // Fallback to cached index.html for navigation requests
-        if (event.request.mode === "navigate") {
-          return caches.match("/index.html") as Promise<Response>;
-        }
-        return new Response("Offline - Recurso indisponível", { status: 503 });
-      });
+      return fetch(event.request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const responseToCache = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, responseToCache);
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => new Response("Offline - Recurso indisponível", { status: 503 }));
     })
   );
 });

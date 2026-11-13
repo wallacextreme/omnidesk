@@ -77,6 +77,8 @@ export function calculateNormalizedCoordinates(
 export class InputController {
   private element: HTMLElement | null = null;
   private videoElement: HTMLVideoElement | null = null;
+  private fallbackWidth = 0;
+  private fallbackHeight = 0;
   private callbacks: InputControllerCallbacks;
   private isAttached = false;
   private lastMoveTime = 0;
@@ -84,6 +86,11 @@ export class InputController {
 
   constructor(callbacks: InputControllerCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public setFallbackDimensions(width: number, height: number): void {
+    this.fallbackWidth = width > 0 ? width : 0;
+    this.fallbackHeight = height > 0 ? height : 0;
   }
 
   public attach(container: HTMLElement, video: HTMLVideoElement): void {
@@ -128,8 +135,14 @@ export class InputController {
   private getCoordinates(e: MouseEvent): NormalizedCoordinates {
     if (!this.element) return { x: 0, y: 0, outOfBounds: true };
     const rect = this.element.getBoundingClientRect();
-    const vW = this.videoElement?.videoWidth || 1920;
-    const vH = this.videoElement?.videoHeight || 1080;
+    const vW =
+      this.videoElement && this.videoElement.videoWidth > 0
+        ? this.videoElement.videoWidth
+        : this.fallbackWidth || 1920;
+    const vH =
+      this.videoElement && this.videoElement.videoHeight > 0
+        ? this.videoElement.videoHeight
+        : this.fallbackHeight || 1080;
     return calculateNormalizedCoordinates(e.clientX, e.clientY, rect, vW, vH);
   }
 

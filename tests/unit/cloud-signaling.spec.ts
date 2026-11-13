@@ -75,25 +75,117 @@ describe("Phase 4: Hybrid Cloud Signaling & Windows 7 Zero-Config", () => {
       manager.close();
     });
 
-    it("should configure OpenRelay TURN servers for symmetric NAT penetration", () => {
-      const { RTC_CONFIG } = require("../../src/core/webrtc-manager");
+    it("should configure working STUN servers without dead blackhole TURN URLs", () => {
+      const { RTC_CONFIG, getEffectiveRtcConfig } = require("../../src/core/webrtc-manager");
       expect(RTC_CONFIG).toBeDefined();
       expect(RTC_CONFIG.iceServers).toBeDefined();
       expect(RTC_CONFIG.iceServers.length).toBeGreaterThan(0);
 
-      const serverUrls = RTC_CONFIG.iceServers[0].urls;
-      const turnUrls = serverUrls.filter((u: string) => u.startsWith("turn:"));
-      expect(turnUrls.length).toBeGreaterThanOrEqual(3);
-      expect(turnUrls.some((u: string) => u.includes(":80"))).toBe(true);
-      expect(turnUrls.some((u: string) => u.includes(":443"))).toBe(true);
-      expect(turnUrls.some((u: string) => u.includes("transport=tcp"))).toBe(true);
-      expect(RTC_CONFIG.iceServers[0].username).toBe("openrelayproject");
-      expect(RTC_CONFIG.iceServers[0].credential).toBe("openrelayproject");
+      const serverUrls = RTC_CONFIG.iceServers[0].urls as string[];
+      expect(serverUrls.some((u: string) => u.includes("stun.l.google.com"))).toBe(true);
+      expect(serverUrls.some((u: string) => u.includes("stun.cloudflare.com"))).toBe(true);
+      expect(serverUrls.some((u: string) => u.includes("openrelay.metered.ca"))).toBe(false);
+
+      const effective = getEffectiveRtcConfig();
+      expect(effective.iceServers?.length).toBeGreaterThan(0);
+    });
+
+    it("should suppress spurious client offers and synthesize MediaStream when ontrack has empty streams", async () => {
+      const { WebRTCManager } = require("../../src/core/webrtc-manager");
+
+      const originalRTCPC = (globalThis as any).RTCPeerConnection;
+      const originalMediaStream = (globalThis as any).MediaStream;
+      const originalRTCSD = (globalThis as any).RTCSessionDescription;
+
+      let capturedPc: any = null;
+      class MockMediaStream {
+        public tracks: any[] = [];
+        addTrack(t: any) {
+          this.tracks.push(t);
+        }
+        getTracks() {
+          return this.tracks;
+        }
+      }
+      class MockRTCPC {
+        public signalingState = "stable";
+        public connectionState = "new";
+        public remoteDescription: any = null;
+        public onicecandidate: any = null;
+        public ontrack: any = null;
+        public onconnectionstatechange: any = null;
+        public onnegotiationneeded: any = null;
+        public ondatachannel: any = null;
+        constructor() {
+          capturedPc = this;
+        }
+        addTransceiver() {
+          // Simulate browser firing negotiationneeded when recvonly transceiver is added
+          if (this.onnegotiationneeded) {
+            void this.onnegotiationneeded();
+          }
+          return {};
+        }
+        createDataChannel() {
+          return { readyState: "open", close() {}, send() {} };
+        }
+        getSenders() {
+          return [];
+        }
+        getTransceivers() {
+          return [];
+        }
+        async createOffer() {
+          return { type: "offer", sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n" };
+        }
+        async createAnswer() {
+          return { type: "answer", sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n" };
+        }
+        async setLocalDescription() {}
+        async setRemoteDescription(desc: any) {
+          this.remoteDescription = desc;
+        }
+        close() {}
+      }
+
+      (globalThis as any).MediaStream = MockMediaStream;
+      (globalThis as any).RTCSessionDescription = function (init: any) {
+        return init;
+      };
+      (globalThis as any).RTCPeerConnection = MockRTCPC;
+
+      try {
+        const signals: any[] = [];
+        let receivedStream: any = null;
+        const clientManager = new WebRTCManager({
+          onSignal: (s: any) => signals.push(s),
+          onRemoteStream: (stream: any) => {
+            receivedStream = stream;
+          },
+        });
+
+        await clientManager.initializeAsClient();
+        // Force negotiationneeded to fire like Chrome does on client recvonly transceiver
+        await capturedPc.onnegotiationneeded?.();
+        expect(signals.filter((s) => s.kind === "offer").length).toBe(0);
+
+        // Simulate Chrome 109 ontrack with empty event.streams
+        const fakeTrack = { kind: "video", id: "v1", stop() {} };
+        capturedPc.ontrack?.({ track: fakeTrack, streams: [] });
+        expect(receivedStream).not.toBeNull();
+        expect(receivedStream.getTracks()).toContain(fakeTrack);
+
+        clientManager.close();
+      } finally {
+        (globalThis as any).RTCPeerConnection = originalRTCPC;
+        (globalThis as any).MediaStream = originalMediaStream;
+        (globalThis as any).RTCSessionDescription = originalRTCSD;
+      }
     });
   });
 
   describe("4. AnyDesk-Style WSS Frame Relay Engine", () => {
-    it("should strictly validate video-frame signaling packets", () => {
+    it("should strictly validate video-frame, video-frame-chunk, video-status, and control-relay packets", () => {
       const { VideoFrameMsgSchema, parseSignalingMessage } = require("../../src/shared/protocol");
       const validFrame = {
         type: "video-frame",
@@ -111,6 +203,41 @@ describe("Phase 4: Hybrid Cloud Signaling & Windows 7 Zero-Config", () => {
       const signaled = parseSignalingMessage(validFrame);
       expect(signaled).not.toBeNull();
       expect(signaled?.type).toBe("video-frame");
+
+      const chunkMsg = parseSignalingMessage({
+        type: "video-frame-chunk",
+        targetId: "123456789",
+        senderId: "987654321",
+        frameId: "frame-1",
+        chunkIndex: 0,
+        totalChunks: 3,
+        data: "data:image/webp;base64,AAAA",
+        width: 960,
+        height: 540,
+        timestamp: Date.now(),
+      });
+      expect(chunkMsg?.type).toBe("video-frame-chunk");
+
+      const statusMsg = parseSignalingMessage({
+        type: "video-status",
+        targetId: "123456789",
+        senderId: "987654321",
+        webrtcActive: true,
+      });
+      expect(statusMsg?.type).toBe("video-status");
+
+      const controlRelayMsg = parseSignalingMessage({
+        type: "control-relay",
+        targetId: "123456789",
+        senderId: "987654321",
+        packet: {
+          kind: "mouse-down",
+          button: "left",
+          x: 0.5,
+          y: 0.5,
+        },
+      });
+      expect(controlRelayMsg?.type).toBe("control-relay");
     });
 
     it("should instantiate and terminate FrameRelayHost safely", () => {

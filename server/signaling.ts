@@ -406,6 +406,20 @@ export class SignalingServer {
         break;
       }
 
+      case "video-frame-chunk":
+      case "video-status":
+      case "control-relay": {
+        const targetNormalized = normalizeDeviceId(msg.targetId);
+        const targetWs = this.hosts.get(targetNormalized);
+        if (targetWs) {
+          this.sendJson(targetWs, {
+            ...msg,
+            senderId: ws.data.id || msg.senderId,
+          });
+        }
+        break;
+      }
+
       default: {
         this.sendJson(ws, {
           type: "error",

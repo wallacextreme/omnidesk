@@ -194,6 +194,28 @@ export const VideoFrameMsgSchema = z.object({
 });
 export type VideoFrameMsg = z.infer<typeof VideoFrameMsgSchema>;
 
+export const VideoFrameChunkMsgSchema = z.object({
+  type: z.literal("video-frame-chunk"),
+  targetId: z.string().regex(DEVICE_ID_REGEX),
+  senderId: z.string().length(9),
+  frameId: z.string().min(1).max(64),
+  chunkIndex: z.number().int().nonnegative(),
+  totalChunks: z.number().int().positive(),
+  data: z.string(),
+  width: z.number(),
+  height: z.number(),
+  timestamp: z.number(),
+});
+export type VideoFrameChunkMsg = z.infer<typeof VideoFrameChunkMsgSchema>;
+
+export const VideoStatusMsgSchema = z.object({
+  type: z.literal("video-status"),
+  targetId: z.string().regex(DEVICE_ID_REGEX),
+  senderId: z.string().length(9),
+  webrtcActive: z.boolean(),
+});
+export type VideoStatusMsg = z.infer<typeof VideoStatusMsgSchema>;
+
 // Heartbeat & Errors
 export const PingMsgSchema = z.object({ type: z.literal("ping") });
 export const PongMsgSchema = z.object({ type: z.literal("pong") });
@@ -204,26 +226,6 @@ export const ErrorMsgSchema = z.object({
   message: z.string(),
 });
 export type ErrorMsg = z.infer<typeof ErrorMsgSchema>;
-
-// Combined Discriminated Union for all Signaling Messages
-export const SignalingMessageSchema = z.discriminatedUnion("type", [
-  RegisterHostMsgSchema,
-  RegisteredMsgSchema,
-  PeerStatusRequestMsgSchema,
-  PeerStatusResponseMsgSchema,
-  SessionRequestMsgSchema,
-  AuthChallengeMsgSchema,
-  AuthResponseMsgSchema,
-  SessionAcceptedMsgSchema,
-  SessionRejectedMsgSchema,
-  WebRTCSignalMsgSchema,
-  SessionCloseMsgSchema,
-  VideoFrameMsgSchema,
-  PingMsgSchema,
-  PongMsgSchema,
-  ErrorMsgSchema,
-]);
-export type SignalingMessage = z.infer<typeof SignalingMessageSchema>;
 
 // ==========================================
 // 4. DATA CHANNEL #1: CONTROL CHANNEL PACKETS
@@ -307,6 +309,38 @@ export const ControlChannelPacketSchema = z.discriminatedUnion("kind", [
   TelemetryPacketSchema,
 ]);
 export type ControlChannelPacket = z.infer<typeof ControlChannelPacketSchema>;
+
+// Fallback Control Relay over WSS when WebRTC DataChannel is unavailable
+export const ControlRelayMsgSchema = z.object({
+  type: z.literal("control-relay"),
+  targetId: z.string().regex(DEVICE_ID_REGEX),
+  senderId: z.string().length(9),
+  packet: ControlChannelPacketSchema,
+});
+export type ControlRelayMsg = z.infer<typeof ControlRelayMsgSchema>;
+
+// Combined Discriminated Union for all Signaling Messages
+export const SignalingMessageSchema = z.discriminatedUnion("type", [
+  RegisterHostMsgSchema,
+  RegisteredMsgSchema,
+  PeerStatusRequestMsgSchema,
+  PeerStatusResponseMsgSchema,
+  SessionRequestMsgSchema,
+  AuthChallengeMsgSchema,
+  AuthResponseMsgSchema,
+  SessionAcceptedMsgSchema,
+  SessionRejectedMsgSchema,
+  WebRTCSignalMsgSchema,
+  SessionCloseMsgSchema,
+  VideoFrameMsgSchema,
+  VideoFrameChunkMsgSchema,
+  VideoStatusMsgSchema,
+  ControlRelayMsgSchema,
+  PingMsgSchema,
+  PongMsgSchema,
+  ErrorMsgSchema,
+]);
+export type SignalingMessage = z.infer<typeof SignalingMessageSchema>;
 
 // ==========================================
 // 5. DATA CHANNEL #2: FILE & CLIPBOARD PACKETS

@@ -6,7 +6,7 @@ import {
   MessageSquare,
   XCircle,
   Activity,
-  Shield,
+  Monitor,
   Laptop,
 } from "lucide-react";
 import { formatDeviceId, type ACLPermissions } from "../shared/protocol";
@@ -22,6 +22,8 @@ interface HostActiveSessionBarProps {
   onToggleFiles: () => void;
   onEndSession: () => void;
   unreadChatCount?: number;
+  isSyntheticStream?: boolean;
+  onShareRealScreen?: () => void;
 }
 
 export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
@@ -34,6 +36,8 @@ export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
   onToggleFiles,
   onEndSession,
   unreadChatCount = 0,
+  isSyntheticStream = false,
+  onShareRealScreen,
 }) => {
   return (
     <aside
@@ -72,6 +76,18 @@ export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
 
         {/* Center/Right: ACL Controls & Actions */}
         <div className="flex items-center gap-2">
+          {isSyntheticStream && onShareRealScreen && (
+            <button
+              data-testid="share-real-screen-btn"
+              onClick={onShareRealScreen}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition-colors cursor-pointer"
+              title="Compartilhar janela ou tela real neste dispositivo"
+            >
+              <Monitor className="w-3.5 h-3.5" />
+              <span>Compartilhar Tela Real</span>
+            </button>
+          )}
+
           {/* Toggle Mouse & Keyboard Input */}
           <button
             data-testid="toggle-input-block-btn"

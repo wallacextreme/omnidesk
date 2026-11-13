@@ -20,6 +20,7 @@ import type { ACLPermissions } from "../shared/protocol";
 interface SessionHUDProps {
   telemetry: TelemetryStats;
   isFallbackRelay?: boolean;
+  relayStats?: { fps: number; bitrateKbps: number };
   permissions: ACLPermissions;
   onToggleInputBlock: () => void;
   onSendSpecialKey: (action: "ctrl-alt-del" | "lock" | "esc") => void;
@@ -37,6 +38,7 @@ interface SessionHUDProps {
 export const SessionHUD: React.FC<SessionHUDProps> = ({
   telemetry,
   isFallbackRelay = false,
+  relayStats,
   permissions,
   onToggleInputBlock,
   onSendSpecialKey,
@@ -99,7 +101,13 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span>WSS Relay</span>
               <span className="text-slate-500">|</span>
-              <span className="text-slate-300">~5 FPS</span>
+              <span className="text-slate-300">{relayStats ? `${relayStats.fps} FPS` : "Ativo"}</span>
+              {relayStats && relayStats.bitrateKbps > 0 && (
+                <>
+                  <span className="text-slate-500">|</span>
+                  <span className="text-slate-400">{relayStats.bitrateKbps} kbps</span>
+                </>
+              )}
             </div>
           ) : telemetry.fps === 0 && telemetry.bitrateKbps === 0 ? (
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ShieldAlert,
   MousePointer,
@@ -28,31 +28,32 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
 }) => {
   const [timeLeft, setTimeLeft] = useState(30);
   const [perms, setPerms] = useState<ACLPermissions>({ ...defaultPermissions });
+  const onRejectRef = useRef(onReject);
+  onRejectRef.current = onReject;
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setTimeLeft((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          onReject("Tempo de espera para aprovação expirado (30s).");
-          return 0;
-        }
-        return prev - 1;
-      });
+      setTimeLeft((prev) => (prev <= 1 ? 0 : prev - 1));
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [onReject]);
+  }, []);
+
+  useEffect(() => {
+    if (timeLeft === 0) {
+      onRejectRef.current("Tempo de espera para aprovação expirado (30s).");
+    }
+  }, [timeLeft]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onReject("Solicitação cancelada pelo usuário (ESC).");
+        onRejectRef.current("Solicitação cancelada pelo usuário (ESC).");
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onReject]);
+  }, []);
 
   const togglePerm = (key: keyof ACLPermissions) => {
     setPerms((prev) => ({

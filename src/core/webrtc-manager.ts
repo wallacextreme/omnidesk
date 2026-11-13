@@ -21,25 +21,63 @@ export interface WebRTCManagerCallbacks {
   onControlPacket?: (packet: ControlChannelPacket) => void;
   onTransferPacket?: (packet: TransferChannelPacket) => void;
   onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+  onLocalStreamEnded?: () => void;
+  onControlChannelStateChange?: (open: boolean) => void;
   onTelemetry?: (stats: TelemetryStats) => void;
 }
 
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  {
+    urls: [
+      "stun:stun.l.google.com:19302",
+      "stun:stun1.l.google.com:19302",
+      "stun:stun.cloudflare.com:3478",
+      "stun:stun.relay.metered.ca:80",
+    ],
+  },
+];
+
 export const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    {
-      urls: [
-        "stun:stun.l.google.com:19302",
-        "stun:stun.cloudflare.com:3478",
-        "turn:openrelay.metered.ca:80",
-        "turn:openrelay.metered.ca:443",
-        "turn:openrelay.metered.ca:443?transport=tcp",
-      ],
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-  ],
-  iceCandidatePoolSize: 4,
+  iceServers: DEFAULT_ICE_SERVERS,
+  iceCandidatePoolSize: 2,
 };
+
+/**
+ * Returns WebRTC RTCConfiguration, optionally prepending user-configured TURN/ICE
+ * servers stored in localStorage ("omnidesk_ice_servers") without dead public TURN URLs.
+ */
+export function getEffectiveRtcConfig(): RTCConfiguration {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem("omnidesk_ice_servers");
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        const customList = Array.isArray(parsed) ? parsed : [parsed];
+        const validCustom: RTCIceServer[] = [];
+        for (const item of customList) {
+          if (item && typeof item === "object" && "urls" in item) {
+            const candidate = item as RTCIceServer;
+            if (
+              typeof candidate.urls === "string" ||
+              (Array.isArray(candidate.urls) && candidate.urls.length > 0)
+            ) {
+              validCustom.push(candidate);
+            }
+          }
+        }
+        if (validCustom.length > 0) {
+          return {
+            iceServers: [...validCustom, ...DEFAULT_ICE_SERVERS],
+            iceCandidatePoolSize: 2,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[WebRTCManager] Ignoring invalid omnidesk_ice_servers config:", err);
+  }
+  return RTC_CONFIG;
+}
 
 export class WebRTCManager {
   private pc: RTCPeerConnection | null = null;
@@ -52,80 +90,220 @@ export class WebRTCManager {
   private statsInterval: ReturnType<typeof setInterval> | null = null;
   private lastBytesReceived = 0;
   private lastStatsTimestamp = 0;
+  private role: "host" | "client" | null = null;
+  private isInitializing = false;
+  private makingOffer = false;
+  private epoch = 0;
+  private signalQueue: Promise<void> = Promise.resolve();
 
   constructor(callbacks: WebRTCManagerCallbacks) {
     this.callbacks = callbacks;
   }
 
+  public getRole(): "host" | "client" | null {
+    return this.role;
+  }
+
+  public hasOpenControlChannel(): boolean {
+    return Boolean(this.controlChannel && this.controlChannel.readyState === "open");
+  }
+
+  public getConnectionState(): RTCPeerConnectionState | "closed" {
+    return this.pc ? this.pc.connectionState : "closed";
+  }
+
   public async initializeAsHost(providedStream?: MediaStream): Promise<void> {
     this.close();
-    this.pc = new RTCPeerConnection(RTC_CONFIG);
-    this.setupPeerConnectionEvents();
+    const currentEpoch = this.epoch;
+    this.role = "host";
+    this.isInitializing = true;
 
-    // Create Data Channels
-    this.controlChannel = this.pc.createDataChannel("control-channel", {
-      ordered: false,
-      maxRetransmits: 0,
-    });
-    this.setupControlChannel(this.controlChannel);
-
-    this.transferChannel = this.pc.createDataChannel("transfer-channel", {
-      ordered: true,
-    });
-    this.setupTransferChannel(this.transferChannel);
-
-    // Capture or attach screen track
     try {
-      this.localStream = providedStream || (await nativeBridge.captureScreen());
-      for (const track of this.localStream.getTracks()) {
-        this.pc.addTrack(track, this.localStream);
-        track.onended = () => {
-          console.info("[WebRTCManager] Local screen track ended by user");
-          this.callbacks.onConnectionStateChange?.("closed");
-        };
+      this.pc = new RTCPeerConnection(getEffectiveRtcConfig());
+      this.setupPeerConnectionEvents();
+
+      // Create Data Channels (ordered=false/maxRetransmits=0 for low-latency control)
+      this.controlChannel = this.pc.createDataChannel("control-channel", {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      this.setupControlChannel(this.controlChannel);
+
+      this.transferChannel = this.pc.createDataChannel("transfer-channel", {
+        ordered: true,
+      });
+      this.setupTransferChannel(this.transferChannel);
+
+      const stream = providedStream || (await nativeBridge.captureScreen());
+      if (this.epoch !== currentEpoch || !this.pc) {
+        if (!providedStream) {
+          for (const t of stream.getTracks()) {
+            try {
+              t.stop();
+            } catch {}
+          }
+        }
+        return;
       }
+
+      this.attachLocalStreamTracks(stream, currentEpoch, false);
       this.prioritizeLightweightCodecs();
+
+      await this.negotiateAsHost();
+      if (this.epoch === currentEpoch) {
+        this.startTelemetryPolling();
+      }
     } catch (err) {
-      console.error("[WebRTCManager] Failed to attach screen for host:", err);
+      console.error("[WebRTCManager] Failed to initialize host WebRTC:", err);
       this.close();
       throw err;
+    } finally {
+      if (this.epoch === currentEpoch) {
+        this.isInitializing = false;
+      }
     }
-
-    // Create offer
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
-
-    if (offer.sdp) {
-      this.callbacks.onSignal({
-        kind: "offer",
-        sdp: offer.sdp,
-      });
-    }
-
-    this.startTelemetryPolling();
   }
 
   public addLocalStream(stream: MediaStream): void {
-    this.localStream = stream;
+    const currentEpoch = this.epoch;
+    const needsRenegotiation = this.attachLocalStreamTracks(stream, currentEpoch, true);
     if (this.pc) {
-      for (const track of stream.getTracks()) {
-        try {
-          this.pc.addTrack(track, stream);
-          track.onended = () => {
-            console.info("[WebRTCManager] Local screen track ended by user");
-            this.callbacks.onConnectionStateChange?.("closed");
-          };
-        } catch (err) {
-          console.warn("[WebRTCManager] Error adding track to PC:", err);
+      this.prioritizeLightweightCodecs();
+      if (
+        needsRenegotiation &&
+        this.role === "host" &&
+        !this.isInitializing &&
+        this.pc.signalingState === "stable"
+      ) {
+        void this.negotiateAsHost();
+      }
+    }
+  }
+
+  public async replaceLocalStream(stream: MediaStream): Promise<void> {
+    const previousStream = this.localStream;
+    if (previousStream && previousStream !== stream) {
+      for (const oldTrack of previousStream.getTracks()) {
+        oldTrack.onended = null;
+      }
+    }
+
+    const currentEpoch = this.epoch;
+    if (!this.pc) {
+      this.localStream = stream;
+      return;
+    }
+
+    const newTracks = stream.getTracks();
+    let needsRenegotiation = false;
+
+    for (const track of newTracks) {
+      const sender = this.pc
+        .getSenders()
+        .find((s) => s.track?.kind === track.kind || (s.track === null && track.kind === "video"));
+      if (sender && typeof sender.replaceTrack === "function") {
+        await sender.replaceTrack(track);
+      } else {
+        this.pc.addTrack(track, stream);
+        needsRenegotiation = true;
+      }
+      track.onended = () => {
+        if (this.localStream === stream && this.epoch === currentEpoch) {
+          console.info("[WebRTCManager] Local screen track ended by user");
+          this.callbacks.onLocalStreamEnded?.();
+        }
+      };
+    }
+
+    this.localStream = stream;
+    this.prioritizeLightweightCodecs();
+
+    if (previousStream && previousStream !== stream) {
+      for (const oldTrack of previousStream.getTracks()) {
+        if (!newTracks.includes(oldTrack)) {
+          try {
+            oldTrack.stop();
+          } catch {}
         }
       }
-      this.prioritizeLightweightCodecs();
+    }
+
+    if (
+      needsRenegotiation &&
+      this.role === "host" &&
+      !this.isInitializing &&
+      this.pc.signalingState === "stable"
+    ) {
+      await this.negotiateAsHost();
+    }
+  }
+
+  private attachLocalStreamTracks(
+    stream: MediaStream,
+    currentEpoch: number,
+    allowReplace: boolean
+  ): boolean {
+    if (this.localStream && this.localStream !== stream) {
+      for (const oldTrack of this.localStream.getTracks()) {
+        oldTrack.onended = null;
+      }
+    }
+    this.localStream = stream;
+    if (!this.pc) return false;
+
+    let addedNewTrack = false;
+    for (const track of stream.getTracks()) {
+      try {
+        if (allowReplace) {
+          const sender = this.pc.getSenders().find((s) => s.track?.kind === track.kind);
+          if (sender && typeof sender.replaceTrack === "function") {
+            void sender.replaceTrack(track);
+          } else {
+            this.pc.addTrack(track, stream);
+            addedNewTrack = true;
+          }
+        } else {
+          this.pc.addTrack(track, stream);
+          addedNewTrack = true;
+        }
+        track.onended = () => {
+          if (this.localStream === stream && this.epoch === currentEpoch) {
+            console.info("[WebRTCManager] Local screen track ended by user");
+            this.callbacks.onLocalStreamEnded?.();
+          }
+        };
+      } catch (err) {
+        console.warn("[WebRTCManager] Error attaching track to PC:", err);
+      }
+    }
+    return addedNewTrack;
+  }
+
+  private async negotiateAsHost(): Promise<void> {
+    if (!this.pc || this.role !== "host" || this.makingOffer) return;
+    if (this.pc.signalingState !== "stable") return;
+
+    this.makingOffer = true;
+    try {
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      if (offer.sdp) {
+        this.callbacks.onSignal({
+          kind: "offer",
+          sdp: offer.sdp,
+        });
+      }
+    } catch (err) {
+      console.warn("[WebRTCManager] negotiateAsHost error:", err);
+    } finally {
+      this.makingOffer = false;
     }
   }
 
   public async initializeAsClient(): Promise<void> {
     this.close();
-    this.pc = new RTCPeerConnection(RTC_CONFIG);
+    this.role = "client";
+    this.pc = new RTCPeerConnection(getEffectiveRtcConfig());
     this.setupPeerConnectionEvents();
 
     // Explicitly add recvonly video transceiver so SDP offer/answer negotiates incoming host video stream
@@ -153,62 +331,92 @@ export class WebRTCManager {
   }
 
   public async handleRemoteSignal(payload: WebRTCSignalPayload): Promise<void> {
-    if (!this.pc) {
-      console.warn("[WebRTCManager] Received signal before initialization");
-      return;
-    }
-
-    switch (payload.kind) {
-      case "offer": {
-        await this.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: payload.sdp }));
-        await this.drainPendingIceCandidates();
-        const answer = await this.pc.createAnswer();
-        await this.pc.setLocalDescription(answer);
-        if (answer.sdp) {
-          this.callbacks.onSignal({
-            kind: "answer",
-            sdp: answer.sdp,
-          });
-        }
-        break;
-      }
-
-      case "answer": {
-        await this.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: payload.sdp }));
-        await this.drainPendingIceCandidates();
-        break;
-      }
-
-      case "ice-candidate": {
-        const init: RTCIceCandidateInit = {
-          candidate: payload.candidate.candidate,
-        };
-        if (payload.candidate.sdpMid !== undefined) {
-          init.sdpMid = payload.candidate.sdpMid;
-        }
-        if (payload.candidate.sdpMLineIndex !== undefined) {
-          init.sdpMLineIndex = payload.candidate.sdpMLineIndex;
-        }
-        if (payload.candidate.usernameFragment !== undefined) {
-          init.usernameFragment = payload.candidate.usernameFragment;
+    const targetEpoch = this.epoch;
+    this.signalQueue = this.signalQueue
+      .then(async () => {
+        if (!this.pc || this.epoch !== targetEpoch) {
+          return;
         }
 
-        if (!this.pc.remoteDescription) {
-          this.pendingIceCandidates.push(init);
-        } else {
-          try {
-            await this.pc.addIceCandidate(new RTCIceCandidate(init));
-          } catch (err) {
-            console.warn("[WebRTCManager] Failed to add ICE candidate:", err);
+        switch (payload.kind) {
+          case "offer": {
+            if (this.pc.signalingState !== "stable") {
+              if (this.role === "client") {
+                try {
+                  await this.pc.setLocalDescription({ type: "rollback" });
+                } catch {}
+              } else {
+                // Host owns negotiation; ignore glare offers from peers when mid-offer
+                return;
+              }
+            }
+            await this.pc.setRemoteDescription(
+              new RTCSessionDescription({ type: "offer", sdp: payload.sdp })
+            );
+            await this.drainPendingIceCandidates();
+            const answer = await this.pc.createAnswer();
+            await this.pc.setLocalDescription(answer);
+            if (answer.sdp) {
+              this.callbacks.onSignal({
+                kind: "answer",
+                sdp: answer.sdp,
+              });
+            }
+            break;
+          }
+
+          case "answer": {
+            if (this.pc.signalingState !== "have-local-offer") {
+              console.warn(
+                "[WebRTCManager] Ignoring unexpected answer in state:",
+                this.pc.signalingState
+              );
+              return;
+            }
+            await this.pc.setRemoteDescription(
+              new RTCSessionDescription({ type: "answer", sdp: payload.sdp })
+            );
+            await this.drainPendingIceCandidates();
+            break;
+          }
+
+          case "ice-candidate": {
+            const init: RTCIceCandidateInit = {
+              candidate: payload.candidate.candidate,
+            };
+            if (payload.candidate.sdpMid !== undefined) {
+              init.sdpMid = payload.candidate.sdpMid;
+            }
+            if (payload.candidate.sdpMLineIndex !== undefined) {
+              init.sdpMLineIndex = payload.candidate.sdpMLineIndex;
+            }
+            if (payload.candidate.usernameFragment !== undefined) {
+              init.usernameFragment = payload.candidate.usernameFragment;
+            }
+
+            if (!this.pc.remoteDescription) {
+              this.pendingIceCandidates.push(init);
+            } else {
+              try {
+                await this.pc.addIceCandidate(new RTCIceCandidate(init));
+              } catch (err) {
+                console.warn("[WebRTCManager] Failed to add ICE candidate:", err);
+              }
+            }
+            break;
+          }
+
+          default: {
+            const _exhaustive: never = payload;
+            void _exhaustive;
           }
         }
-        break;
-      }
+      })
+      .catch((err) => {
+        console.warn("[WebRTCManager] handleRemoteSignal error:", err);
+      });
 
-      default: {
-        const _exhaustive: never = payload;
-      }
-    }
+    return this.signalQueue;
   }
 
   private async drainPendingIceCandidates(): Promise<void> {
@@ -268,12 +476,22 @@ export class WebRTCManager {
   }
 
   public close(): void {
+    this.epoch++;
+    this.role = null;
+    this.isInitializing = false;
+    this.makingOffer = false;
+    this.signalQueue = Promise.resolve();
     this.stopTelemetryPolling();
 
     if (this.controlChannel) {
+      this.controlChannel.onopen = null;
+      this.controlChannel.onclose = null;
+      this.controlChannel.onerror = null;
       this.controlChannel.close();
       this.controlChannel = null;
     }
+    this.callbacks.onControlChannelStateChange?.(false);
+
     if (this.transferChannel) {
       this.transferChannel.close();
       this.transferChannel = null;
@@ -281,6 +499,7 @@ export class WebRTCManager {
     if (this.localStream) {
       for (const track of this.localStream.getTracks()) {
         try {
+          track.onended = null;
           track.stop();
         } catch {}
       }
@@ -380,17 +599,10 @@ export class WebRTCManager {
 
     this.pc.onnegotiationneeded = async () => {
       try {
-        if (!this.pc) return;
-        if (this.pc.signalingState === "stable") {
-          const offer = await this.pc.createOffer();
-          await this.pc.setLocalDescription(offer);
-          if (offer.sdp) {
-            this.callbacks.onSignal({
-              kind: "offer",
-              sdp: offer.sdp,
-            });
-          }
+        if (!this.pc || this.role !== "host" || this.isInitializing || this.makingOffer) {
+          return;
         }
+        await this.negotiateAsHost();
       } catch (err) {
         console.warn("[WebRTCManager] onnegotiationneeded error:", err);
       }
@@ -398,6 +610,15 @@ export class WebRTCManager {
   }
 
   private setupControlChannel(channel: RTCDataChannel): void {
+    channel.onopen = () => {
+      this.callbacks.onControlChannelStateChange?.(true);
+    };
+    channel.onclose = () => {
+      this.callbacks.onControlChannelStateChange?.(false);
+    };
+    channel.onerror = () => {
+      this.callbacks.onControlChannelStateChange?.(false);
+    };
     channel.onmessage = (event) => {
       try {
         const raw = JSON.parse(event.data as string);

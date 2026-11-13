@@ -73,6 +73,9 @@ export class CloudWSSSignaling implements ISignalingTransport {
   private myTopic: string = "";
   private isDestroyed = false;
   private connected = false;
+  private consecutiveFailures = 0;
+  private failoverTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly textDecoder = new TextDecoder("utf-8");
 
   constructor(private handlers: SignalingClientHandlers) {}
 
@@ -82,6 +85,7 @@ export class CloudWSSSignaling implements ISignalingTransport {
 
   public connect(options: ConnectOptions): void {
     this.isDestroyed = false;
+    this.consecutiveFailures = 0;
 
     // Retrieve or generate persistent 9-digit deviceId
     let devId = options.deviceId;
@@ -105,8 +109,16 @@ export class CloudWSSSignaling implements ISignalingTransport {
     this.connectBroker();
   }
 
+  private clearFailoverTimer(): void {
+    if (this.failoverTimer) {
+      clearTimeout(this.failoverTimer);
+      this.failoverTimer = null;
+    }
+  }
+
   private connectBroker(): void {
     if (this.isDestroyed) return;
+    this.clearFailoverTimer();
 
     if (this.client) {
       try {
@@ -124,12 +136,14 @@ export class CloudWSSSignaling implements ISignalingTransport {
         clean: true,
         connectTimeout: 7000,
         keepalive: 30,
-        reconnectPeriod: 4000,
+        reconnectPeriod: 3000,
       });
 
       this.client.on("connect", () => {
         if (this.isDestroyed || !this.client) return;
         this.connected = true;
+        this.consecutiveFailures = 0;
+        this.clearFailoverTimer();
 
         // Subscribe to our exclusive peer topic
         this.client.subscribe(this.myTopic, { qos: 1 }, (err) => {
@@ -150,27 +164,33 @@ export class CloudWSSSignaling implements ISignalingTransport {
         });
       });
 
-      this.client.on("message", (_topic: string, payload: Buffer) => {
+      this.client.on("message", (_topic: string, payload: Uint8Array | Buffer) => {
         if (this.isDestroyed) return;
         try {
-          const raw = JSON.parse(payload.toString("utf-8"));
+          const text = typeof payload === "string" ? payload : this.textDecoder.decode(payload);
+          const raw = JSON.parse(text);
           const validMsg = parseSignalingMessage(raw);
           if (validMsg) {
             this.handlers.onMessage?.(validMsg);
           }
-        } catch (err) {
+        } catch {
           // Discard malformed packets silently per Zero-Trust specification
         }
       });
 
       this.client.on("error", (err) => {
         console.warn(`[CloudWSS] Error on broker ${brokerUrl}:`, err.message);
+        const wasConnected = this.connected;
         this.connected = false;
-        this.failoverBroker();
+        this.consecutiveFailures++;
+        if (!wasConnected && this.consecutiveFailures >= 2) {
+          this.failoverBroker();
+        }
       });
 
       this.client.on("close", () => {
         if (this.isDestroyed) return;
+        const wasConnected = this.connected;
         this.connected = false;
         this.handlers.onStatusChange?.({
           online: false,
@@ -178,26 +198,37 @@ export class CloudWSSSignaling implements ISignalingTransport {
           label: "Reconectando Nuvem...",
           brokerOrUrl: brokerUrl,
         });
+        if (!wasConnected) {
+          this.consecutiveFailures++;
+          if (this.consecutiveFailures >= 2) {
+            this.failoverBroker();
+          }
+        }
       });
     } catch (err) {
       console.warn("[CloudWSS] Broker connect threw error:", err);
+      this.consecutiveFailures++;
       this.failoverBroker();
     }
   }
 
   private failoverBroker(): void {
-    if (this.isDestroyed) return;
+    if (this.isDestroyed || this.failoverTimer) return;
+    this.consecutiveFailures = 0;
     this.currentBrokerIndex = (this.currentBrokerIndex + 1) % CLOUD_BROKERS.length;
     const nextBroker = CLOUD_BROKERS[this.currentBrokerIndex]!;
     console.info(`[CloudWSS] Switching to backup WSS broker: ${nextBroker}`);
-    setTimeout(() => {
+    this.failoverTimer = setTimeout(() => {
+      this.failoverTimer = null;
       if (!this.isDestroyed) this.connectBroker();
     }, 1500);
   }
 
   public send(message: SignalingMessage): void {
     if (!this.client || !this.connected) {
-      console.warn("[CloudWSS] Cannot send, client not connected");
+      if (message.type !== "video-frame" && message.type !== "video-frame-chunk") {
+        console.warn("[CloudWSS] Cannot send, client not connected");
+      }
       return;
     }
 
@@ -217,9 +248,11 @@ export class CloudWSSSignaling implements ISignalingTransport {
 
     const targetTopic = `omnidesk/v1/peer/${targetId}`;
     const payloadStr = JSON.stringify(message);
+    const isMediaFrame = message.type === "video-frame" || message.type === "video-frame-chunk";
+    const qos: 0 | 1 = isMediaFrame ? 0 : 1;
 
-    this.client.publish(targetTopic, payloadStr, { qos: 1, retain: false }, (err) => {
-      if (err) {
+    this.client.publish(targetTopic, payloadStr, { qos, retain: false }, (err) => {
+      if (err && !isMediaFrame) {
         console.warn(`[CloudWSS] Publish error to ${targetTopic}:`, err);
       }
     });
@@ -228,6 +261,7 @@ export class CloudWSSSignaling implements ISignalingTransport {
   public disconnect(): void {
     this.isDestroyed = true;
     this.connected = false;
+    this.clearFailoverTimer();
     if (this.client) {
       try {
         this.client.end(true);

@@ -11,12 +11,15 @@ import type { FileTransferProgress } from "../core/file-transfer";
 interface RemoteSessionViewportProps {
   remoteStream: MediaStream | null;
   fallbackFrame?: string | null;
+  fallbackFrameSize?: { width: number; height: number } | null;
   telemetry: TelemetryStats;
+  relayStats?: { fps: number; bitrateKbps: number };
   permissions: ACLPermissions;
   onSendInputPacket: (packet: InputPacket) => void;
   onToggleInputBlock: () => void;
   onSendSpecialKey: (action: "ctrl-alt-del" | "lock" | "esc") => void;
   onEndSession: () => void;
+  onWebRtcVideoActiveChange?: (active: boolean) => void;
   chatMessages: ChatMessagePacket[];
   onSendChatMessage: (text: string) => void;
   localSenderName: string;
@@ -29,12 +32,15 @@ interface RemoteSessionViewportProps {
 export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   remoteStream,
   fallbackFrame,
+  fallbackFrameSize,
   telemetry,
+  relayStats,
   permissions,
   onSendInputPacket,
   onToggleInputBlock,
   onSendSpecialKey,
   onEndSession,
+  onWebRtcVideoActiveChange,
   chatMessages,
   onSendChatMessage,
   localSenderName,
@@ -46,6 +52,8 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const inputControllerRef = useRef<InputController | null>(null);
+  const onWebRtcVideoActiveChangeRef = useRef(onWebRtcVideoActiveChange);
+  onWebRtcVideoActiveChangeRef.current = onWebRtcVideoActiveChange;
 
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
@@ -62,20 +70,51 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     }
   }, [fallbackFrame]);
 
-  // Attach stream to video element
+  // Keep InputController fallback dimensions synced when WSS frame arrives
+  useEffect(() => {
+    if (fallbackFrameSize && inputControllerRef.current) {
+      inputControllerRef.current.setFallbackDimensions(
+        fallbackFrameSize.width,
+        fallbackFrameSize.height
+      );
+    }
+  }, [fallbackFrameSize]);
+
+  // Notify parent when real WebRTC decoded video becomes active/inactive
+  useEffect(() => {
+    onWebRtcVideoActiveChangeRef.current?.(isWebRtcPlaying);
+  }, [isWebRtcPlaying]);
+
+  // Attach stream to video element and verify actual decoded video frames (videoWidth > 0)
   useEffect(() => {
     const video = videoRef.current;
-    if (video && remoteStream) {
-      video.srcObject = remoteStream;
-      video.muted = true; // Crucial to prevent browser blocking autoplay
-      video.play()
-        .then(() => {
-          setIsWebRtcPlaying(true);
-        })
-        .catch((err) => {
-          console.warn("[RemoteViewport] Auto-play video error:", err);
-        });
+    if (!video) return;
+
+    if (!remoteStream) {
+      if (video.srcObject !== null) {
+        video.srcObject = null;
+      }
+      setIsWebRtcPlaying(false);
+      return;
     }
+
+    if (video.srcObject !== remoteStream) {
+      video.srcObject = remoteStream;
+    }
+    video.muted = true; // Crucial to prevent browser blocking autoplay
+    video.play().catch((err) => {
+      console.warn("[RemoteViewport] Auto-play video warning:", err);
+    });
+
+    const verifyVideoFrames = () => {
+      const hasDecodedFrame =
+        video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+      setIsWebRtcPlaying(hasDecodedFrame);
+    };
+
+    verifyVideoFrames();
+    const poll = setInterval(verifyVideoFrames, 400);
+    return () => clearInterval(poll);
   }, [remoteStream]);
 
   // Global ESC key listener to safely exit session from anywhere
@@ -131,6 +170,9 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
 
     if (containerRef.current && videoRef.current) {
       controller.attach(containerRef.current, videoRef.current);
+      if (fallbackFrameSize) {
+        controller.setFallbackDimensions(fallbackFrameSize.width, fallbackFrameSize.height);
+      }
     }
 
     return () => {
@@ -172,6 +214,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       <SessionHUD
         telemetry={telemetry}
         isFallbackRelay={!isWebRtcPlaying && Boolean(fallbackFrame)}
+        {...(relayStats ? { relayStats } : {})}
         permissions={permissions}
         onToggleInputBlock={onToggleInputBlock}
         onSendSpecialKey={onSendSpecialKey}
@@ -188,7 +231,10 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
 
       {/* Waiting for Host video stream loader (unblurred, clear instructions) */}
       {!isWebRtcPlaying && !fallbackFrame && !hasReceivedFirstFrame && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-300 z-10 pointer-events-none select-none">
+        <div
+          data-testid="waiting-video-overlay"
+          className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-300 z-10 pointer-events-none select-none"
+        >
           <div className="w-12 h-12 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin mb-4" />
           <p className="text-sm font-semibold text-white mb-1">Aguardando transmissão de vídeo do Host...</p>
           <p className="text-xs text-slate-400">Pressione ESC ou clique no botão acima a qualquer momento para cancelar.</p>
@@ -215,6 +261,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       {/* Fallback Image Frame (Rendered when WebRTC is negotiating/slow or on legacy systems) */}
       {!isWebRtcPlaying && fallbackFrame && (
         <img
+          data-testid="remote-fallback-image"
           src={fallbackFrame}
           alt="Transmissão Remota em Tempo Real"
           className="w-full h-full object-contain pointer-events-none select-none"
@@ -224,15 +271,41 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       {/* Hardware Accelerated Video Stream (Always mounted) */}
       <video
         ref={videoRef}
+        data-testid="remote-video-element"
         autoPlay
         playsInline
         muted
-        onPlaying={() => setIsWebRtcPlaying(true)}
-        onLoadedData={() => {
-          if (videoRef.current && videoRef.current.videoWidth > 0) {
+        onPlaying={() => {
+          if (
+            videoRef.current &&
+            videoRef.current.readyState >= 2 &&
+            videoRef.current.videoWidth > 0 &&
+            videoRef.current.videoHeight > 0
+          ) {
             setIsWebRtcPlaying(true);
           }
         }}
+        onLoadedData={() => {
+          if (
+            videoRef.current &&
+            videoRef.current.readyState >= 2 &&
+            videoRef.current.videoWidth > 0 &&
+            videoRef.current.videoHeight > 0
+          ) {
+            setIsWebRtcPlaying(true);
+          }
+        }}
+        onResize={() => {
+          if (
+            videoRef.current &&
+            videoRef.current.readyState >= 2 &&
+            videoRef.current.videoWidth > 0 &&
+            videoRef.current.videoHeight > 0
+          ) {
+            setIsWebRtcPlaying(true);
+          }
+        }}
+        onEmptied={() => setIsWebRtcPlaying(false)}
         className={`w-full h-full object-contain pointer-events-none transition-opacity duration-300 ${
           isWebRtcPlaying ? "opacity-100" : "opacity-0 absolute inset-0"
         }`}

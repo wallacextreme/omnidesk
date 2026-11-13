@@ -31,9 +31,14 @@ import {
   parseSignalingMessage,
   type ACLPermissions,
   type ChatMessagePacket,
+  type ControlChannelPacket,
   type InputPacket,
   type SignalingMessage,
+  type WebRTCSignalPayload,
 } from "./shared/protocol";
+
+const FRAME_CHUNK_SIZE = 20_000;
+const DIRECT_FRAME_LIMIT = 24_000;
 
 function getInitialSignalingUrl(): string {
   if (typeof window === "undefined") return "ws://localhost:4000";
@@ -128,6 +133,12 @@ export const App: React.FC = () => {
   });
   const [activeAcl, setActiveAcl] = useState<ACLPermissions>({ ...DEFAULT_ACL_PERMISSIONS });
   const [fallbackFrame, setFallbackFrame] = useState<string | null>(null);
+  const [fallbackFrameSize, setFallbackFrameSize] = useState<{ width: number; height: number } | null>(null);
+  const [relayStats, setRelayStats] = useState<{ fps: number; bitrateKbps: number }>({
+    fps: 0,
+    bitrateKbps: 0,
+  });
+  const [hostIsSyntheticStream, setHostIsSyntheticStream] = useState<boolean>(false);
 
   // Chat & File Transfer State
   const [chatMessages, setChatMessages] = useState<ChatMessagePacket[]>([]);
@@ -160,14 +171,46 @@ export const App: React.FC = () => {
   const deviceIdRef = useRef<string>(deviceId);
   const unattendedPasswordRef = useRef<string>(unattendedPassword);
   const defaultAclRef = useRef<ACLPermissions>(defaultAcl);
+  const sessionRoleRef = useRef<"idle" | "host" | "client">(sessionRole);
+  const remotePeerIdRef = useRef<string>(remotePeerId);
+  const activeAclRef = useRef<ACLPermissions>(activeAcl);
   const signalingClientRef = useRef<SignalingClient | null>(null);
   const hostSecretRef = useRef<string>(getOrCreateHostSecret());
   const webrtcRef = useRef<WebRTCManager | null>(null);
   const frameRelayRef = useRef<FrameRelayHost | null>(null);
-  const pendingSignalsRef = useRef<any[]>([]);
+  const hostStreamRef = useRef<MediaStream | null>(null);
+  const pendingSignalsRef = useRef<WebRTCSignalPayload[]>([]);
   const aclGuardRef = useRef<ACLGuard>(new ACLGuard(DEFAULT_ACL_PERMISSIONS));
   const fileSenderRef = useRef<FileSender | null>(null);
   const fileReceiverRef = useRef<FileReceiver | null>(null);
+  const frameSeqRef = useRef<number>(0);
+  const lastWssMouseMoveRef = useRef<number>(0);
+  const frameChunkBufferRef = useRef<
+    Map<
+      string,
+      {
+        total: number;
+        parts: (string | undefined)[];
+        received: number;
+        width: number;
+        height: number;
+        timestamp: number;
+        createdAt: number;
+      }
+    >
+  >(new Map());
+  const relayMeterRef = useRef<{
+    frames: number;
+    bytes: number;
+    windowStart: number;
+    latestTimestamp: number;
+  }>({
+    frames: 0,
+    bytes: 0,
+    windowStart: Date.now(),
+    latestTimestamp: 0,
+  });
+  const handleEndSessionRef = useRef<(notifyPeer?: boolean) => void>(() => {});
   const currentChallengeRef = useRef<{
     nonce: string;
     salt: string;
@@ -180,6 +223,18 @@ export const App: React.FC = () => {
   useEffect(() => {
     deviceIdRef.current = deviceId;
   }, [deviceId]);
+
+  useEffect(() => {
+    sessionRoleRef.current = sessionRole;
+  }, [sessionRole]);
+
+  useEffect(() => {
+    remotePeerIdRef.current = remotePeerId;
+  }, [remotePeerId]);
+
+  useEffect(() => {
+    activeAclRef.current = activeAcl;
+  }, [activeAcl]);
 
   useEffect(() => {
     unattendedPasswordRef.current = unattendedPassword;
@@ -218,25 +273,155 @@ export const App: React.FC = () => {
     signalingClientRef.current?.switchMode(mode, customUrl);
   }, []);
 
-  // Instant WSS Frame Relay (AnyDesk fallback)
+  const recordRelayThroughput = useCallback((byteCount: number, isHostSide: boolean) => {
+    const meter = relayMeterRef.current;
+    const now = Date.now();
+    // Reset stale window if this is the first frame after idle time
+    if (meter.frames === 0 || now - meter.windowStart > 3000) {
+      meter.frames = 1;
+      meter.bytes = byteCount;
+      meter.windowStart = now;
+      return;
+    }
+    meter.frames += 1;
+    meter.bytes += byteCount;
+    const elapsedMs = now - meter.windowStart;
+    if (elapsedMs >= 1000) {
+      const elapsedSec = elapsedMs / 1000;
+      const fps = Math.max(1, Math.round(meter.frames / elapsedSec));
+      const bitrateKbps = Math.round((meter.bytes * 8) / elapsedSec / 1000);
+      meter.frames = 0;
+      meter.bytes = 0;
+      meter.windowStart = now;
+      setRelayStats({ fps, bitrateKbps });
+      if (isHostSide && webrtcRef.current?.getConnectionState() !== "connected") {
+        setTelemetry((prev) => ({
+          ...prev,
+          fps,
+          bitrateKbps,
+        }));
+      }
+    }
+  }, []);
+
+  const commitCompleteFallbackFrame = useCallback(
+    (frameDataUrl: string, width: number, height: number, timestamp: number) => {
+      if (timestamp < relayMeterRef.current.latestTimestamp) {
+        return; // Drop stale out-of-order frame
+      }
+      relayMeterRef.current.latestTimestamp = timestamp;
+      setFallbackFrame(frameDataUrl);
+      setFallbackFrameSize({ width, height });
+      recordRelayThroughput(frameDataUrl.length, false);
+    },
+    [recordRelayThroughput]
+  );
+
+  const handleIncomingControlPacket = useCallback((role: "host" | "client", packet: ControlChannelPacket) => {
+    if (role === "host") {
+      if (packet.kind === "acl-update") {
+        aclGuardRef.current.setAll(packet.permissions);
+        setActiveAcl(packet.permissions);
+        activeAclRef.current = packet.permissions;
+        return;
+      }
+
+      if (!aclGuardRef.current.canExecuteControlPacket(packet)) {
+        return; // Dropped by Zero-Trust ACL Guard
+      }
+
+      if (packet.kind === "chat-message") {
+        setChatMessages((prev) => [...prev, packet]);
+        return;
+      }
+
+      if (
+        packet.kind.startsWith("mouse-") ||
+        packet.kind.startsWith("key-") ||
+        packet.kind === "special-key"
+      ) {
+        void nativeBridge.injectInput(packet as InputPacket);
+      }
+    } else {
+      if (packet.kind === "acl-update") {
+        setActiveAcl(packet.permissions);
+        activeAclRef.current = packet.permissions;
+      } else if (packet.kind === "chat-message") {
+        setChatMessages((prev) => [...prev, packet]);
+      }
+    }
+  }, []);
+
+  const sendControlPacketWithFallback = useCallback(
+    (packet: ControlChannelPacket) => {
+      const sentViaWebRTC = webrtcRef.current?.sendControlPacket(packet) ?? false;
+      if (!sentViaWebRTC && remotePeerIdRef.current && deviceIdRef.current) {
+        if (packet.kind === "mouse-move") {
+          const now = Date.now();
+          if (now - lastWssMouseMoveRef.current < 80) return;
+          lastWssMouseMoveRef.current = now;
+        }
+        sendSignaling({
+          type: "control-relay",
+          targetId: remotePeerIdRef.current,
+          senderId: deviceIdRef.current,
+          packet,
+        });
+      }
+    },
+    [sendSignaling]
+  );
+
+  // Instant WSS Frame Relay (AnyDesk fallback, auto-chunked for public MQTT reliability)
   const startFrameRelay = useCallback(
     (stream: MediaStream, targetPeerId: string) => {
       frameRelayRef.current?.stop();
+      relayMeterRef.current = {
+        frames: 0,
+        bytes: 0,
+        windowStart: Date.now(),
+        latestTimestamp: 0,
+      };
       const relay = new FrameRelayHost(stream, (dataUrl, w, h) => {
-        sendSignaling({
-          type: "video-frame",
-          targetId: targetPeerId,
-          senderId: deviceIdRef.current,
-          frameDataUrl: dataUrl,
-          width: w,
-          height: h,
-          timestamp: Date.now(),
-        });
+        const now = Date.now();
+        recordRelayThroughput(dataUrl.length, true);
+        if (dataUrl.length <= DIRECT_FRAME_LIMIT) {
+          sendSignaling({
+            type: "video-frame",
+            targetId: targetPeerId,
+            senderId: deviceIdRef.current,
+            frameDataUrl: dataUrl,
+            width: w,
+            height: h,
+            timestamp: now,
+          });
+        } else {
+          const frameId = `${now.toString(36)}-${++frameSeqRef.current}`;
+          const totalChunks = Math.ceil(dataUrl.length / FRAME_CHUNK_SIZE);
+          for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            const slice = dataUrl.slice(
+              chunkIndex * FRAME_CHUNK_SIZE,
+              (chunkIndex + 1) * FRAME_CHUNK_SIZE
+            );
+            sendSignaling({
+              type: "video-frame-chunk",
+              targetId: targetPeerId,
+              senderId: deviceIdRef.current,
+              frameId,
+              chunkIndex,
+              totalChunks,
+              data: slice,
+              width: w,
+              height: h,
+              timestamp: now,
+            });
+          }
+        }
       });
       relay.start(200, 960);
       frameRelayRef.current = relay;
     },
-    [sendSignaling]
+    [sendSignaling, recordRelayThroughput]
   );
 
   // WebRTC Setup Helper
@@ -244,6 +429,7 @@ export const App: React.FC = () => {
     async (role: "host" | "client", targetId: string, providedStream?: MediaStream) => {
       if (webrtcRef.current) {
         webrtcRef.current.close();
+        webrtcRef.current = null;
       }
 
       const myDeviceId = deviceIdRef.current;
@@ -263,40 +449,31 @@ export const App: React.FC = () => {
         onTelemetry: (stats) => {
           setTelemetry(stats);
         },
+        onLocalStreamEnded: () => {
+          handleEndSessionRef.current(true);
+        },
         onConnectionStateChange: (state) => {
-          if (state === "disconnected" || state === "failed" || state === "closed") {
-            handleEndSession();
+          if (state === "failed") {
+            // Keep session active on WSS Frame Relay instead of abruptly closing
+            if (role === "client") {
+              setRemoteStream(null);
+              if (remotePeerIdRef.current) {
+                sendSignaling({
+                  type: "video-status",
+                  targetId: remotePeerIdRef.current,
+                  senderId: deviceIdRef.current,
+                  webrtcActive: false,
+                });
+              }
+            } else {
+              frameRelayRef.current?.resume();
+            }
+          } else if (state === "disconnected" && role === "host") {
+            frameRelayRef.current?.resume();
           }
         },
         onControlPacket: (packet) => {
-          // If host, verify ACL before injecting
-          if (role === "host") {
-            if (packet.kind === "acl-update") {
-              aclGuardRef.current.setAll(packet.permissions);
-              setActiveAcl(packet.permissions);
-              return;
-            }
-
-            if (!aclGuardRef.current.canExecuteControlPacket(packet)) {
-              return; // Dropped by Zero-Trust ACL Guard
-            }
-
-            if (packet.kind === "chat-message") {
-              setChatMessages((prev) => [...prev, packet]);
-              return;
-            }
-
-            if (packet.kind.startsWith("mouse-") || packet.kind.startsWith("key-") || packet.kind === "special-key") {
-              nativeBridge.injectInput(packet as InputPacket);
-            }
-          } else {
-            // Client side receiving packets
-            if (packet.kind === "acl-update") {
-              setActiveAcl(packet.permissions);
-            } else if (packet.kind === "chat-message") {
-              setChatMessages((prev) => [...prev, packet]);
-            }
-          }
+          handleIncomingControlPacket(role, packet);
         },
         onTransferPacket: (packet) => {
           if (role === "host" && !aclGuardRef.current.canExecuteTransferPacket(packet)) {
@@ -305,8 +482,6 @@ export const App: React.FC = () => {
           fileReceiverRef.current?.handlePacket(packet);
         },
       });
-
-      webrtcRef.current = manager;
 
       // File transfer handlers
       fileSenderRef.current = new FileSender({
@@ -329,18 +504,24 @@ export const App: React.FC = () => {
         await manager.initializeAsClient();
       }
 
-      // Drain any queued signals received before webrtc initialization
+      webrtcRef.current = manager;
+
+      // Drain any queued signals received before WebRTC initialization completed
       while (pendingSignalsRef.current.length > 0) {
-        const pending = pendingSignalsRef.current.shift()!;
-        await manager.handleRemoteSignal(pending);
+        const pending = pendingSignalsRef.current.shift();
+        if (pending) {
+          await manager.handleRemoteSignal(pending);
+        }
       }
 
+      sessionRoleRef.current = role;
+      remotePeerIdRef.current = targetId;
       setSessionRole(role);
       setRemotePeerId(targetId);
       setSessionActive(true);
       setIsConnecting(false);
     },
-    [sendSignaling]
+    [sendSignaling, handleIncomingControlPacket]
   );
 
   const setupWebRTCRef = useRef(setupWebRTC);
@@ -439,29 +620,53 @@ export const App: React.FC = () => {
                   );
 
                   if (isValid) {
+                    let stream: MediaStream;
                     try {
-                      const stream = await nativeBridge.captureScreen();
-                      startFrameRelay(stream, msg.senderId);
-                      await setupWebRTCRef.current("host", msg.senderId, stream);
-                      sendSignaling({
-                        type: "session-accepted",
-                        targetId: msg.senderId,
-                        senderId: deviceIdRef.current,
-                        permissions: defaultAclRef.current,
-                      });
+                      stream = await nativeBridge.captureScreen();
                     } catch (err) {
                       console.warn("[App] Host unattended screen capture failed:", err);
                       sendSignaling({
                         type: "session-rejected",
                         targetId: msg.senderId,
+                        senderId: deviceIdRef.current,
                         reason: "Captura de tela cancelada no Host.",
                       });
-                      handleEndSession();
+                      handleEndSessionRef.current(false);
+                      currentChallengeRef.current = null;
+                      break;
+                    }
+
+                    hostStreamRef.current = stream;
+                    setHostIsSyntheticStream(nativeBridge.isSyntheticStream(stream));
+                    aclGuardRef.current.setAll(defaultAclRef.current);
+                    setActiveAcl(defaultAclRef.current);
+                    activeAclRef.current = defaultAclRef.current;
+                    remotePeerIdRef.current = msg.senderId;
+                    sessionRoleRef.current = "host";
+                    setRemotePeerId(msg.senderId);
+                    setSessionRole("host");
+                    setSessionActive(true);
+                    setIsConnecting(false);
+
+                    // Notify client accepted ONLY AFTER screen stream is ready
+                    sendSignaling({
+                      type: "session-accepted",
+                      targetId: msg.senderId,
+                      senderId: deviceIdRef.current,
+                      permissions: defaultAclRef.current,
+                    });
+
+                    startFrameRelay(stream, msg.senderId);
+                    try {
+                      await setupWebRTCRef.current("host", msg.senderId, stream);
+                    } catch (rtcErr) {
+                      console.warn("[App] WebRTC setup failed in unattended mode, continuing on WSS Relay:", rtcErr);
                     }
                   } else {
                     sendSignaling({
                       type: "session-rejected",
                       targetId: msg.senderId,
+                      senderId: deviceIdRef.current,
                       reason: "Senha de acesso desassistido incorreta.",
                     });
                   }
@@ -473,8 +678,19 @@ export const App: React.FC = () => {
               case "session-accepted": {
                 // Client receives acceptance from host
                 setActiveAcl(msg.permissions);
+                activeAclRef.current = msg.permissions;
                 aclGuardRef.current.setAll(msg.permissions);
-                await setupWebRTCRef.current("client", msg.senderId);
+                remotePeerIdRef.current = msg.senderId;
+                sessionRoleRef.current = "client";
+                setRemotePeerId(msg.senderId);
+                setSessionRole("client");
+                setSessionActive(true);
+                setIsConnecting(false);
+                try {
+                  await setupWebRTCRef.current("client", msg.senderId);
+                } catch (rtcErr) {
+                  console.warn("[App] WebRTC client init failed, continuing on WSS Relay:", rtcErr);
+                }
                 break;
               }
 
@@ -485,7 +701,84 @@ export const App: React.FC = () => {
               }
 
               case "video-frame": {
-                setFallbackFrame(msg.frameDataUrl);
+                commitCompleteFallbackFrame(
+                  msg.frameDataUrl,
+                  msg.width,
+                  msg.height,
+                  msg.timestamp
+                );
+                break;
+              }
+
+              case "video-frame-chunk": {
+                const nowMs = Date.now();
+                const map = frameChunkBufferRef.current;
+                if (nowMs % 10 === 0 || map.size > 6) {
+                  for (const [fid, entry] of map.entries()) {
+                    if (nowMs - entry.createdAt > 5000 || entry.timestamp < relayMeterRef.current.latestTimestamp) {
+                      map.delete(fid);
+                    }
+                  }
+                }
+                let entry = map.get(msg.frameId);
+                if (!entry) {
+                  if (msg.timestamp < relayMeterRef.current.latestTimestamp) {
+                    break;
+                  }
+                  entry = {
+                    total: msg.totalChunks,
+                    parts: new Array<string | undefined>(msg.totalChunks),
+                    received: 0,
+                    width: msg.width,
+                    height: msg.height,
+                    timestamp: msg.timestamp,
+                    createdAt: nowMs,
+                  };
+                  map.set(msg.frameId, entry);
+                }
+                if (msg.chunkIndex < entry.total && entry.parts[msg.chunkIndex] === undefined) {
+                  entry.parts[msg.chunkIndex] = msg.data;
+                  entry.received += 1;
+                }
+                if (entry.received === entry.total) {
+                  const fullDataUrl = entry.parts.join("");
+                  map.delete(msg.frameId);
+                  // Drop older incomplete frames so stale chunks never overwrite latest screen
+                  for (const [fid, other] of map.entries()) {
+                    if (other.timestamp <= entry.timestamp) {
+                      map.delete(fid);
+                    }
+                  }
+                  if (fullDataUrl.startsWith("data:image/")) {
+                    commitCompleteFallbackFrame(
+                      fullDataUrl,
+                      entry.width,
+                      entry.height,
+                      entry.timestamp
+                    );
+                  }
+                }
+                break;
+              }
+
+              case "video-status": {
+                if (sessionRoleRef.current === "host" && msg.senderId === remotePeerIdRef.current) {
+                  if (msg.webrtcActive) {
+                    frameRelayRef.current?.pause();
+                  } else {
+                    frameRelayRef.current?.resume();
+                  }
+                }
+                break;
+              }
+
+              case "control-relay": {
+                if (
+                  sessionRoleRef.current === "host" ||
+                  sessionRoleRef.current === "client"
+                ) {
+                  handleIncomingControlPacket(sessionRoleRef.current, msg.packet);
+                }
                 break;
               }
 
@@ -499,7 +792,7 @@ export const App: React.FC = () => {
               }
 
               case "session-close": {
-                handleEndSession();
+                handleEndSessionRef.current(false);
                 break;
               }
             }
@@ -525,7 +818,7 @@ export const App: React.FC = () => {
       client.disconnect();
       signalingClientRef.current = null;
     };
-  }, [signalingMode, signalingUrl, deviceName, sendSignaling]);
+  }, [signalingMode, signalingUrl, deviceName, sendSignaling, startFrameRelay, commitCompleteFallbackFrame, handleIncomingControlPacket]);
 
   // Client Initiates Connection
   const handleConnect = (targetRaw: string, password?: string) => {
@@ -573,34 +866,65 @@ export const App: React.FC = () => {
 
     aclGuardRef.current.setAll(customPermissions);
     setActiveAcl(customPermissions);
+    activeAclRef.current = customPermissions;
 
+    let stream: MediaStream;
     try {
-      // 1. Capture screen FIRST
-      const stream = await nativeBridge.captureScreen();
-
-      // 2. Start instant WSS Frame Relay (AnyDesk style guaranteed video)
-      startFrameRelay(stream, client);
-
-      // 3. Initialize WebRTC on Host with pre-captured stream
-      await setupWebRTC("host", client, stream);
-
-      // 4. Notify client that session is accepted
-      sendSignaling({
-        type: "session-accepted",
-        targetId: client,
-        senderId: deviceIdRef.current,
-        permissions: customPermissions,
-      });
+      // 1. Capture screen FIRST (wait completely until user clicks Share)
+      stream = await nativeBridge.captureScreen(undefined, { allowSyntheticFallback: false });
     } catch (err) {
-      console.warn("[App] Host failed to initialize screen broadcast:", err);
+      console.warn("[App] Host screen capture cancelled or failed:", err);
       sendSignaling({
         type: "session-rejected",
         targetId: client,
         senderId: deviceIdRef.current,
         reason: "Captura de tela cancelada pelo Host ou não autorizada.",
       });
-      handleEndSession();
+      handleEndSessionRef.current(false);
       alert("A captura de tela foi cancelada. A conexão não foi iniciada.");
+      return;
+    }
+
+    hostStreamRef.current = stream;
+    setHostIsSyntheticStream(nativeBridge.isSyntheticStream(stream));
+    remotePeerIdRef.current = client;
+    sessionRoleRef.current = "host";
+    setRemotePeerId(client);
+    setSessionRole("host");
+    setSessionActive(true);
+    setIsConnecting(false);
+
+    // 2. Notify client ONLY AFTER stream is ready so client initializes recvonly before offer
+    sendSignaling({
+      type: "session-accepted",
+      targetId: client,
+      senderId: deviceIdRef.current,
+      permissions: customPermissions,
+    });
+
+    // 3. Start instant chunked WSS Frame Relay (guaranteed image even if UDP/ICE fails)
+    startFrameRelay(stream, client);
+
+    // 4. Initialize WebRTC P2P cleanly with pre-captured stream
+    try {
+      await setupWebRTC("host", client, stream);
+    } catch (rtcErr) {
+      console.warn("[App] WebRTC setup failed on Host, continuing on WSS Relay:", rtcErr);
+    }
+  };
+
+  // Host upgrades synthetic unattended stream to a real user-selected screen
+  const handleShareRealScreen = async () => {
+    if (sessionRoleRef.current !== "host") return;
+    try {
+      const newStream = await nativeBridge.captureScreen(undefined, { allowSyntheticFallback: false });
+      hostStreamRef.current = newStream;
+      setHostIsSyntheticStream(false);
+      frameRelayRef.current?.updateStream(newStream);
+      frameRelayRef.current?.resume();
+      await webrtcRef.current?.replaceLocalStream(newStream);
+    } catch (err) {
+      console.warn("[App] Host cancelled real screen switch:", err);
     }
   };
 
@@ -620,31 +944,28 @@ export const App: React.FC = () => {
   const handleToggleInputBlock = () => {
     const newPerms = { ...activeAcl, allowInput: !activeAcl.allowInput };
     setActiveAcl(newPerms);
+    activeAclRef.current = newPerms;
     aclGuardRef.current.updatePermissions(newPerms);
 
-    if (webrtcRef.current) {
-      webrtcRef.current.sendControlPacket({
-        kind: "acl-update",
-        permissions: newPerms,
-      });
-    }
+    sendControlPacketWithFallback({
+      kind: "acl-update",
+      permissions: newPerms,
+    });
   };
 
   // Send input packet (Client -> Host)
   const handleSendInputPacket = (packet: InputPacket) => {
-    if (webrtcRef.current && activeAcl.allowInput) {
-      webrtcRef.current.sendControlPacket(packet);
+    if (activeAclRef.current.allowInput) {
+      sendControlPacketWithFallback(packet);
     }
   };
 
   // Send Special Key
   const handleSendSpecialKey = (action: "ctrl-alt-del" | "lock" | "esc") => {
-    if (webrtcRef.current) {
-      webrtcRef.current.sendControlPacket({
-        kind: "special-key",
-        action,
-      });
-    }
+    sendControlPacketWithFallback({
+      kind: "special-key",
+      action,
+    });
   };
 
   // Send Chat Message
@@ -657,7 +978,7 @@ export const App: React.FC = () => {
       timestamp: Date.now(),
     };
     setChatMessages((prev) => [...prev, packet]);
-    webrtcRef.current?.sendControlPacket(packet);
+    sendControlPacketWithFallback(packet);
   };
 
   // Send File
@@ -680,36 +1001,78 @@ export const App: React.FC = () => {
   };
 
   // Terminate Active Session
-  const handleEndSession = () => {
-    if (remotePeerId) {
-      sendSignaling({
-        type: "session-close",
-        targetId: remotePeerId,
-        senderId: deviceIdRef.current,
-        reason: "Sessão encerrada pelo usuário.",
-      });
-    }
+  const handleEndSession = useCallback(
+    (notifyPeer = true) => {
+      const peerId = remotePeerIdRef.current;
+      if (notifyPeer && peerId) {
+        sendSignaling({
+          type: "session-close",
+          targetId: peerId,
+          senderId: deviceIdRef.current,
+          reason: "Sessão encerrada pelo usuário.",
+        });
+      }
 
-    frameRelayRef.current?.stop();
-    frameRelayRef.current = null;
-    setFallbackFrame(null);
-    pendingSignalsRef.current = [];
-    nativeBridge.releaseAllInputs();
+      frameRelayRef.current?.stop();
+      frameRelayRef.current = null;
+      if (hostStreamRef.current) {
+        for (const track of hostStreamRef.current.getTracks()) {
+          try {
+            track.onended = null;
+            track.stop();
+          } catch {}
+        }
+        hostStreamRef.current = null;
+      }
+      setHostIsSyntheticStream(false);
+      setFallbackFrame(null);
+      setFallbackFrameSize(null);
+      setRelayStats({ fps: 0, bitrateKbps: 0 });
+      frameChunkBufferRef.current.clear();
+      relayMeterRef.current = {
+        frames: 0,
+        bytes: 0,
+        windowStart: Date.now(),
+        latestTimestamp: 0,
+      };
+      pendingSignalsRef.current = [];
+      nativeBridge.releaseAllInputs();
 
-    webrtcRef.current?.close();
-    webrtcRef.current = null;
-    fileSenderRef.current = null;
-    fileReceiverRef.current = null;
-    setSessionActive(false);
-    setSessionRole("idle");
-    setRemotePeerId("");
-    setRemoteStream(null);
-    setIsConnecting(false);
-    setChatMessages([]);
-    setActiveTransferProgress(null);
-    setHostChatOpen(false);
-    setHostFilesOpen(false);
-  };
+      webrtcRef.current?.close();
+      webrtcRef.current = null;
+      fileSenderRef.current = null;
+      fileReceiverRef.current = null;
+      sessionRoleRef.current = "idle";
+      remotePeerIdRef.current = "";
+      setSessionActive(false);
+      setSessionRole("idle");
+      setRemotePeerId("");
+      setRemoteStream(null);
+      setIsConnecting(false);
+      setTelemetry({ rttMs: 0, fps: 0, bitrateKbps: 0, packetLossPercent: 0 });
+      setChatMessages([]);
+      setActiveTransferProgress(null);
+      setHostChatOpen(false);
+      setHostFilesOpen(false);
+    },
+    [sendSignaling]
+  );
+
+  handleEndSessionRef.current = handleEndSession;
+
+  const handleWebRtcVideoActiveChange = useCallback(
+    (active: boolean) => {
+      if (sessionRoleRef.current === "client" && remotePeerIdRef.current && deviceIdRef.current) {
+        sendSignaling({
+          type: "video-status",
+          targetId: remotePeerIdRef.current,
+          senderId: deviceIdRef.current,
+          webrtcActive: active,
+        });
+      }
+    },
+    [sendSignaling]
+  );
 
   return (
     <div className="w-full min-h-screen bg-[#090d16] text-slate-100 flex flex-col justify-start">
@@ -718,12 +1081,15 @@ export const App: React.FC = () => {
         <RemoteSessionViewport
           remoteStream={remoteStream}
           fallbackFrame={fallbackFrame}
+          fallbackFrameSize={fallbackFrameSize}
           telemetry={telemetry}
+          relayStats={relayStats}
           permissions={activeAcl}
           onSendInputPacket={handleSendInputPacket}
           onToggleInputBlock={handleToggleInputBlock}
           onSendSpecialKey={handleSendSpecialKey}
-          onEndSession={handleEndSession}
+          onEndSession={() => handleEndSession(true)}
+          onWebRtcVideoActiveChange={handleWebRtcVideoActiveChange}
           chatMessages={chatMessages}
           onSendChatMessage={handleSendChatMessage}
           localSenderName={deviceName}
@@ -744,16 +1110,19 @@ export const App: React.FC = () => {
               onUpdatePermissions={(updates) => {
                 const next = { ...activeAcl, ...updates };
                 setActiveAcl(next);
+                activeAclRef.current = next;
                 aclGuardRef.current.updatePermissions(next);
-                webrtcRef.current?.sendControlPacket({
+                sendControlPacketWithFallback({
                   kind: "acl-update",
                   permissions: next,
                 });
               }}
               onToggleChat={() => setHostChatOpen(!hostChatOpen)}
               onToggleFiles={() => setHostFilesOpen(!hostFilesOpen)}
-              onEndSession={handleEndSession}
+              onEndSession={() => handleEndSession(true)}
               unreadChatCount={chatMessages.length}
+              isSyntheticStream={hostIsSyntheticStream}
+              onShareRealScreen={handleShareRealScreen}
             />
           )}
 

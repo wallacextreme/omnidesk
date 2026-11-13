@@ -80,6 +80,168 @@ mod win_input {
         fn SetCursorPos(x: i32, y: i32) -> i32;
         fn LockWorkStation() -> i32;
         fn SetProcessDPIAware() -> i32;
+        fn OpenClipboard(hwnd_new_owner: *const c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn GetClipboardData(u_format: u32) -> *mut c_void;
+        fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
+        fn GlobalLock(h_mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(h_mem: *mut c_void) -> i32;
+        fn GlobalSize(h_mem: *mut c_void) -> usize;
+        fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const GMEM_ZEROINIT: u32 = 0x0040;
+
+    #[repr(C)]
+    struct DROPFILES {
+        p_files: u32,
+        pt_x: i32,
+        pt_y: i32,
+        f_nc: i32,
+        f_wide: i32,
+    }
+
+    fn open_clipboard_with_retry() -> bool {
+        for _ in 0..5 {
+            if unsafe { OpenClipboard(std::ptr::null()) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    pub fn read_clipboard_text() -> Result<String, String> {
+        if !open_clipboard_with_retry() {
+            return Ok(String::new());
+        }
+        let result = unsafe {
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if handle.is_null() {
+                String::new()
+            } else {
+                let ptr = GlobalLock(handle) as *const u16;
+                if ptr.is_null() {
+                    String::new()
+                } else {
+                    let max_words = GlobalSize(handle) / 2;
+                    let slice = std::slice::from_raw_parts(ptr, max_words);
+                    let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+                    let text = String::from_utf16_lossy(&slice[..len]);
+                    let _ = GlobalUnlock(handle);
+                    text
+                }
+            }
+        };
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        Ok(result)
+    }
+
+    pub fn write_clipboard_text(text: &str) -> Result<(), String> {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes_len = wide.len() * size_of::<u16>();
+
+        if !open_clipboard_with_retry() {
+            return Err("Failed to open Windows clipboard".into());
+        }
+        let res = unsafe {
+            let _ = EmptyClipboard();
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE, bytes_len);
+            if h_mem.is_null() {
+                Err("GlobalAlloc failed for clipboard text".into())
+            } else {
+                let dst = GlobalLock(h_mem) as *mut u16;
+                if dst.is_null() {
+                    let _ = GlobalFree(h_mem);
+                    Err("GlobalLock failed for clipboard text".into())
+                } else {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+                    let _ = GlobalUnlock(h_mem);
+                    if SetClipboardData(CF_UNICODETEXT, h_mem).is_null() {
+                        let _ = GlobalFree(h_mem);
+                        Err("SetClipboardData failed for clipboard text".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        res
+    }
+
+    pub fn set_clipboard_file_drop(path: &str) -> Result<(), String> {
+        let mut wide: Vec<u16> = path.encode_utf16().collect();
+        wide.push(0);
+        wide.push(0);
+        let header_size = size_of::<DROPFILES>();
+        let total_bytes = header_size + wide.len() * size_of::<u16>();
+
+        if !open_clipboard_with_retry() {
+            return Err("Failed to open Windows clipboard".into());
+        }
+        let res = unsafe {
+            let _ = EmptyClipboard();
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes);
+            if h_mem.is_null() {
+                Err("GlobalAlloc failed for CF_HDROP".into())
+            } else {
+                let dst = GlobalLock(h_mem) as *mut u8;
+                if dst.is_null() {
+                    let _ = GlobalFree(h_mem);
+                    Err("GlobalLock failed for CF_HDROP".into())
+                } else {
+                    let header = DROPFILES {
+                        p_files: header_size as u32,
+                        pt_x: 0,
+                        pt_y: 0,
+                        f_nc: 0,
+                        f_wide: 1,
+                    };
+                    std::ptr::copy_nonoverlapping(
+                        (&header as *const DROPFILES) as *const u8,
+                        dst,
+                        header_size,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        wide.as_ptr() as *const u8,
+                        dst.add(header_size),
+                        wide.len() * size_of::<u16>(),
+                    );
+                    let _ = GlobalUnlock(h_mem);
+                    if SetClipboardData(CF_HDROP, h_mem).is_null() {
+                        let _ = GlobalFree(h_mem);
+                        Err("SetClipboardData failed for CF_HDROP".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+        unsafe {
+            let _ = CloseClipboard();
+        }
+        res
+    }
+
+    pub fn trigger_ctrl_v() {
+        send_vk(0x11, false, true);  // VK_CONTROL down
+        send_vk(0x56, false, true);  // V down
+        send_vk(0x56, false, false); // V up
+        send_vk(0x11, false, false); // VK_CONTROL up
     }
 
     pub fn ensure_dpi_aware() {
@@ -436,15 +598,130 @@ pub mod commands {
         Ok(())
     }
 
+    fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(input.len() * 3 / 4);
+        let mut buf: u32 = 0;
+        let mut bits: u8 = 0;
+        for b in input.bytes() {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'=' {
+                break;
+            }
+            let val: u32 = match b {
+                b'A'..=b'Z' => (b - b'A') as u32,
+                b'a'..=b'z' => (b - b'a' + 26) as u32,
+                b'0'..=b'9' => (b - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return Err("Invalid base64 character".into()),
+            };
+            buf = (buf << 6) | val;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xFF) as u8);
+            }
+        }
+        Ok(out)
+    }
+
+    fn sanitize_filename(raw: &str) -> String {
+        let base = raw.rsplit(['/', '\\']).next().unwrap_or("arquivo.bin");
+        let cleaned: String = base
+            .chars()
+            .map(|ch| {
+                if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                    '_'
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        let trimmed = cleaned.trim().trim_matches('.');
+        if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+            "arquivo.bin".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn unique_dest_path(dir: &std::path::Path, safe_name: &str) -> std::path::PathBuf {
+        let candidate = dir.join(safe_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        let p = std::path::Path::new(safe_name);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("arquivo");
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+        for idx in 1..1000 {
+            let next_name = if ext.is_empty() {
+                format!("{stem} ({idx})")
+            } else {
+                format!("{stem} ({idx}).{ext}")
+            };
+            let next_path = dir.join(next_name);
+            if !next_path.exists() {
+                return next_path;
+            }
+        }
+        dir.join(format!("{}-{}", std::time::UNIX_EPOCH.elapsed().map(|d| d.as_secs()).unwrap_or(0), safe_name))
+    }
+
     #[tauri::command]
     pub fn read_clipboard() -> Result<String, String> {
-        Ok("".to_string())
+        #[cfg(target_os = "windows")]
+        {
+            return win_input::read_clipboard_text();
+        }
+        #[cfg(not(target_os = "windows"))]
+        Ok(String::new())
     }
 
     #[tauri::command]
     pub fn write_clipboard(text: String) -> Result<(), String> {
-        println!("[OmniDesk Native] Clipboard updated: {} bytes", text.len());
-        Ok(())
+        #[cfg(target_os = "windows")]
+        {
+            return win_input::write_clipboard_text(&text);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = text;
+            Ok(())
+        }
+    }
+
+    #[tauri::command]
+    pub fn save_received_file(
+        file_name: String,
+        data_b64: String,
+        auto_paste: Option<bool>,
+    ) -> Result<String, String> {
+        let bytes = decode_base64(&data_b64)?;
+        let safe_name = sanitize_filename(&file_name);
+        let base_home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dest_dir = base_home.join("Downloads").join("OmniDesk");
+        std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed creating OmniDesk folder: {e}"))?;
+        let final_path = unique_dest_path(&dest_dir, &safe_name);
+        std::fs::write(&final_path, &bytes).map_err(|e| format!("Failed saving file: {e}"))?;
+
+        let final_str = final_path.to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = win_input::set_clipboard_file_drop(&final_str);
+            if auto_paste.unwrap_or(false) {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                win_input::trigger_ctrl_v();
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = auto_paste;
+
+        Ok(final_str)
     }
 }
 
@@ -460,7 +737,8 @@ pub fn run() {
             commands::inject_key_event,
             commands::release_all_inputs,
             commands::read_clipboard,
-            commands::write_clipboard
+            commands::write_clipboard,
+            commands::save_received_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

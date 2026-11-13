@@ -21,7 +21,9 @@ export interface INativeBridge {
 
 declare global {
   interface Window {
-    __TAURI_INTERNALS__?: unknown;
+    __TAURI_INTERNALS__?: {
+      invoke?: <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+    };
     __TAURI__?: {
       core?: {
         invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T>;
@@ -257,10 +259,22 @@ export class NativeBridge implements INativeBridge {
     return typeof window !== "undefined" && (Boolean(window.__TAURI__) || Boolean(window.__TAURI_INTERNALS__));
   }
 
+  private async invokeTauri<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+    if (typeof window !== "undefined") {
+      if (window.__TAURI__?.core?.invoke) {
+        return await window.__TAURI__.core.invoke<T>(cmd, args);
+      }
+      if (window.__TAURI_INTERNALS__?.invoke) {
+        return await window.__TAURI_INTERNALS__.invoke<T>(cmd, args);
+      }
+    }
+    throw new Error("Tauri invoke bridge unavailable");
+  }
+
   public async getMonitors(): Promise<MonitorInfo[]> {
-    if (this.isDesktopApp() && window.__TAURI__?.core) {
+    if (this.isDesktopApp()) {
       try {
-        const monitors = await window.__TAURI__.core.invoke<MonitorInfo[]>("get_monitors");
+        const monitors = await this.invokeTauri<MonitorInfo[]>("get_monitors");
         return monitors;
       } catch (err) {
         console.warn("[NativeBridge] Tauri get_monitors failed, using fallback:", err);
@@ -386,12 +400,12 @@ export class NativeBridge implements INativeBridge {
   }
 
   public async injectInput(packet: InputPacket): Promise<boolean> {
-    if (this.isDesktopApp() && window.__TAURI__?.core) {
+    if (this.isDesktopApp()) {
       try {
         if (packet.kind.startsWith("mouse-")) {
-          await window.__TAURI__.core.invoke("inject_mouse_event", { packet });
+          await this.invokeTauri("inject_mouse_event", { packet });
         } else if (packet.kind.startsWith("key-") || packet.kind === "special-key") {
-          await window.__TAURI__.core.invoke("inject_key_event", { packet });
+          await this.invokeTauri("inject_key_event", { packet });
         }
         return true;
       } catch (err) {
@@ -466,9 +480,9 @@ export class NativeBridge implements INativeBridge {
   }
 
   public async releaseAllInputs(): Promise<boolean> {
-    if (this.isDesktopApp() && window.__TAURI__?.core) {
+    if (this.isDesktopApp()) {
       try {
-        await window.__TAURI__.core.invoke("release_all_inputs");
+        await this.invokeTauri("release_all_inputs");
         return true;
       } catch (err) {
         console.warn("[NativeBridge] Tauri release_all_inputs error:", err);
@@ -483,9 +497,9 @@ export class NativeBridge implements INativeBridge {
   }
 
   public async readClipboard(): Promise<string> {
-    if (this.isDesktopApp() && window.__TAURI__?.core) {
+    if (this.isDesktopApp()) {
       try {
-        return await window.__TAURI__.core.invoke<string>("read_clipboard");
+        return await this.invokeTauri<string>("read_clipboard");
       } catch {
         // fallback
       }
@@ -729,6 +743,24 @@ export class NativeBridge implements INativeBridge {
     data: ArrayBuffer,
     autoPaste = false
   ): Promise<boolean> {
+    if (this.isDesktopApp()) {
+      try {
+        const savedPath = await this.invokeTauri<string>("save_received_file", {
+          fileName,
+          dataB64: this.bytesToBase64(new Uint8Array(data)),
+          autoPaste,
+        });
+        this.emitAgentEvent({
+          kind: "file-saved",
+          path: savedPath,
+          name: fileName,
+          autoPaste,
+        });
+        return true;
+      } catch (err) {
+        console.warn("[NativeBridge] Tauri save_received_file error:", err);
+      }
+    }
     if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
       return false;
     }
@@ -786,9 +818,9 @@ export class NativeBridge implements INativeBridge {
         // Ignore and continue to browser clipboard
       }
     }
-    if (this.isDesktopApp() && window.__TAURI__?.core) {
+    if (this.isDesktopApp()) {
       try {
-        await window.__TAURI__.core.invoke("write_clipboard", { text });
+        await this.invokeTauri("write_clipboard", { text });
         return true;
       } catch {
         // fallback

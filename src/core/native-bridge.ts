@@ -314,7 +314,8 @@ export class NativeBridge implements INativeBridge {
           video: {
             frameRate: { ideal: 30, max: 60 },
             displaySurface: "monitor",
-          },
+            cursor: "never",
+          } as MediaTrackConstraints & { cursor?: string },
           audio: false,
         });
       } catch (firstErr) {

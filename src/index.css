@@ -42,5 +42,5 @@
 }
 
 .animate-click-ripple {
-  animation: click-ripple 0.24s cubic-bezier(0, 0, 0.2, 1) 1 forwards;
+  animation: click-ripple 0.18s cubic-bezier(0, 0, 0.2, 1) 1 forwards;
 }

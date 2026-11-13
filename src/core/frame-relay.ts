@@ -13,7 +13,7 @@ export class FrameRelayHost {
   private isPaused = false;
   private maxWidth = 1280;
   private intervalMs = 200;
-  private adaptiveQuality = 0.72;
+  private adaptiveQuality = 0.78;
   private webpSupported: boolean | null = null;
   private lastFrameDataUrl = "";
   private lastSentAt = 0;

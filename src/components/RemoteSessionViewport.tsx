@@ -106,7 +106,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [quality, setQuality] = useState<"performance" | "balanced" | "original">("balanced");
-  const [hideLocalCursor, setHideLocalCursor] = useState(true);
+  const [hideLocalCursor, setHideLocalCursor] = useState(false);
   const [isPointerOverVideo, setIsPointerOverVideo] = useState(false);
   const [isViewportDragOver, setIsViewportDragOver] = useState(false);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
@@ -120,7 +120,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     if (!clickRipple) return;
     const timer = window.setTimeout(() => {
       setClickRipple(null);
-    }, 260);
+    }, 200);
     return () => {
       window.clearTimeout(timer);
     };

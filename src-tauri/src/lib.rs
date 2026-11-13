@@ -390,56 +390,62 @@ mod win_input {
     }
 }
 
-#[tauri::command]
-pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
+pub mod commands {
     #[cfg(target_os = "windows")]
-    let (width, height) = win_input::primary_screen_size();
-    #[cfg(not(target_os = "windows"))]
-    let (width, height) = (1920u32, 1080u32);
+    use super::win_input;
+    use super::MonitorInfo;
 
-    Ok(vec![MonitorInfo {
-        id: "display-0".into(),
-        name: "Primary Display".into(),
-        width,
-        height,
-        is_primary: true,
-    }])
-}
+    #[tauri::command]
+    pub fn get_monitors() -> Result<Vec<MonitorInfo>, String> {
+        #[cfg(target_os = "windows")]
+        let (width, height) = win_input::primary_screen_size();
+        #[cfg(not(target_os = "windows"))]
+        let (width, height) = (1920u32, 1080u32);
 
-#[tauri::command]
-pub fn inject_mouse_event(packet: serde_json::Value) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    win_input::handle_mouse(&packet);
-    #[cfg(not(target_os = "windows"))]
-    let _ = packet;
-    Ok(())
-}
+        Ok(vec![MonitorInfo {
+            id: "display-0".into(),
+            name: "Primary Display".into(),
+            width,
+            height,
+            is_primary: true,
+        }])
+    }
 
-#[tauri::command]
-pub fn inject_key_event(packet: serde_json::Value) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    win_input::handle_key(&packet);
-    #[cfg(not(target_os = "windows"))]
-    let _ = packet;
-    Ok(())
-}
+    #[tauri::command]
+    pub fn inject_mouse_event(packet: serde_json::Value) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        win_input::handle_mouse(&packet);
+        #[cfg(not(target_os = "windows"))]
+        let _ = packet;
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn release_all_inputs() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    win_input::release_all();
-    Ok(())
-}
+    #[tauri::command]
+    pub fn inject_key_event(packet: serde_json::Value) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        win_input::handle_key(&packet);
+        #[cfg(not(target_os = "windows"))]
+        let _ = packet;
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn read_clipboard() -> Result<String, String> {
-    Ok("".to_string())
-}
+    #[tauri::command]
+    pub fn release_all_inputs() -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        win_input::release_all();
+        Ok(())
+    }
 
-#[tauri::command]
-pub fn write_clipboard(text: String) -> Result<(), String> {
-    println!("[OmniDesk Native] Clipboard updated: {} bytes", text.len());
-    Ok(())
+    #[tauri::command]
+    pub fn read_clipboard() -> Result<String, String> {
+        Ok("".to_string())
+    }
+
+    #[tauri::command]
+    pub fn write_clipboard(text: String) -> Result<(), String> {
+        println!("[OmniDesk Native] Clipboard updated: {} bytes", text.len());
+        Ok(())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -449,12 +455,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            get_monitors,
-            inject_mouse_event,
-            inject_key_event,
-            release_all_inputs,
-            read_clipboard,
-            write_clipboard
+            commands::get_monitors,
+            commands::inject_mouse_event,
+            commands::inject_key_event,
+            commands::release_all_inputs,
+            commands::read_clipboard,
+            commands::write_clipboard
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

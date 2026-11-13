@@ -968,7 +968,7 @@ namespace OmniDeskAgent
             string kind;
             if (!pkt.TryGetValue("kind", out kind)) return;
 
-            if (kind == "set-clipboard-text")
+            if (kind == "set-clipboard-text" || kind == "clipboard-set")
             {
                 string text;
                 if (!pkt.TryGetValue("text", out text)) text = "";
@@ -1002,17 +1002,48 @@ namespace OmniDeskAgent
                 return;
             }
 
+            if (kind == "save-file")
+            {
+                string fileName;
+                string dataB64;
+                if (!pkt.TryGetValue("fileName", out fileName) || !pkt.TryGetValue("dataB64", out dataB64)) return;
+                string fileId;
+                if (!pkt.TryGetValue("fileId", out fileId) || string.IsNullOrEmpty(fileId))
+                {
+                    fileId = "single-" + Guid.NewGuid().ToString("N");
+                }
+                string folder;
+                pkt.TryGetValue("folder", out folder);
+                string autoPasteStr;
+                bool autoPaste = pkt.TryGetValue("autoPaste", out autoPasteStr) && autoPasteStr == "true";
+
+                try
+                {
+                    string destDir = ResolveSaveDestinationDir(folder);
+                    string safeName = SanitizeFileName(fileName);
+                    string finalPath = GetUniqueDestPath(destDir, safeName);
+                    byte[] raw = string.IsNullOrEmpty(dataB64) ? new byte[0] : Convert.FromBase64String(dataB64);
+                    File.WriteAllBytes(finalPath, raw);
+                    FinalizeSavedFile(conn, fileId, finalPath, autoPaste);
+                }
+                catch (Exception ex)
+                {
+                    SendWsText(conn, "{\"kind\":\"agent-error\",\"message\":\"" + EscapeJson("Falha ao salvar arquivo: " + ex.Message) + "\"}");
+                }
+                return;
+            }
+
             if (kind == "save-file-start")
             {
                 string fileId;
                 string fileName;
                 if (!pkt.TryGetValue("fileId", out fileId) || !pkt.TryGetValue("fileName", out fileName)) return;
+                string folder;
+                pkt.TryGetValue("folder", out folder);
                 string autoPasteStr;
                 bool autoPaste = pkt.TryGetValue("autoPaste", out autoPasteStr) && autoPasteStr == "true";
 
-                string downloadsRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-                string destDir = Path.Combine(downloadsRoot, "OmniDesk");
-                Directory.CreateDirectory(destDir);
+                string destDir = ResolveSaveDestinationDir(folder);
 
                 string safeName = SanitizeFileName(fileName);
                 string tempPath = Path.Combine(destDir, ".tmp-" + Guid.NewGuid().ToString("N") + ".part");
@@ -1079,33 +1110,7 @@ namespace OmniDeskAgent
                     psf.Writer.Dispose();
                     psf.Writer = null;
                     File.Move(psf.TempPath, finalPath);
-
-                    RunOnStaSync(delegate
-                    {
-                        try
-                        {
-                            StringCollection sc = new StringCollection();
-                            sc.Add(finalPath);
-                            _ignoreClipboardUntilUtc = DateTime.UtcNow.AddSeconds(2);
-                            _lastClipboardSignature = "F:" + finalPath.ToLowerInvariant();
-                            Clipboard.SetFileDropList(sc);
-                        }
-                        catch { }
-                    });
-
-                    if (psf.AutoPaste)
-                    {
-                        Thread.Sleep(60);
-                        _executor.TriggerCtrlV();
-                    }
-
-                    SendWsText(
-                        conn,
-                        "{\"kind\":\"file-saved\",\"fileId\":\"" + EscapeJson(fileId) +
-                        "\",\"name\":\"" + EscapeJson(Path.GetFileName(finalPath)) +
-                        "\",\"path\":\"" + EscapeJson(finalPath) +
-                        "\",\"autoPaste\":" + (psf.AutoPaste ? "true" : "false") + "}"
-                    );
+                    FinalizeSavedFile(conn, fileId, finalPath, psf.AutoPaste);
                 }
                 catch
                 {
@@ -1116,6 +1121,52 @@ namespace OmniDeskAgent
             }
 
             _executor.Execute(pkt);
+        }
+
+        private static string ResolveSaveDestinationDir(string folder)
+        {
+            string destDir;
+            if (string.Equals(folder, "desktop", StringComparison.OrdinalIgnoreCase))
+            {
+                destDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            }
+            else
+            {
+                string downloadsRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                destDir = Path.Combine(downloadsRoot, "OmniDesk");
+            }
+            Directory.CreateDirectory(destDir);
+            return destDir;
+        }
+
+        private void FinalizeSavedFile(ClientConn conn, string fileId, string finalPath, bool autoPaste)
+        {
+            RunOnStaSync(delegate
+            {
+                try
+                {
+                    StringCollection sc = new StringCollection();
+                    sc.Add(finalPath);
+                    _ignoreClipboardUntilUtc = DateTime.UtcNow.AddSeconds(2);
+                    _lastClipboardSignature = "F:" + finalPath.ToLowerInvariant();
+                    Clipboard.SetFileDropList(sc);
+                }
+                catch { }
+            });
+
+            if (autoPaste)
+            {
+                Thread.Sleep(60);
+                _executor.TriggerCtrlV();
+            }
+
+            SendWsText(
+                conn,
+                "{\"kind\":\"file-saved\",\"fileId\":\"" + EscapeJson(fileId) +
+                "\",\"name\":\"" + EscapeJson(Path.GetFileName(finalPath)) +
+                "\",\"path\":\"" + EscapeJson(finalPath) +
+                "\",\"autoPaste\":" + (autoPaste ? "true" : "false") + "}"
+            );
         }
 
         private void StreamClipboardFileToClient(ClientConn conn, string fileId, string fullPath)
@@ -1452,15 +1503,19 @@ namespace OmniDeskAgent
     {
         private const string RunRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "OmniDeskAgent";
+        private const string AgentPrefsRegistryPath = @"Software\OmniDesk\Agent";
+        private const string AutoStartConfiguredValueName = "AutoStartConfigured";
 
         private readonly LoopbackBridgeServer _server;
         private readonly InputExecutor _executor;
         private readonly Label _statusLabel;
         private readonly Label _eventsLabel;
         private readonly CheckBox _autoStartCheck;
+        private readonly MenuItem _trayAutoStartItem;
         private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _uiTimer;
         private readonly bool _startInTray;
+        private bool _syncingAutoStartUi;
         private bool _closing;
 
         public AgentForm(LoopbackBridgeServer server, InputExecutor executor, bool startInTray)
@@ -1468,6 +1523,8 @@ namespace OmniDeskAgent
             _server = server;
             _executor = executor;
             _startInTray = startInTray;
+
+            EnsureAutoStartConfiguredOnFirstRun();
 
             _server.AttachStaDispatcher(delegate(Action work)
             {
@@ -1512,12 +1569,11 @@ namespace OmniDeskAgent
             _autoStartCheck.Font = new Font("Segoe UI", 9, FontStyle.Regular);
             _autoStartCheck.ForeColor = Color.FromArgb(226, 232, 240);
             _autoStartCheck.SetBounds(20, 106, 400, 24);
-            _autoStartCheck.Checked = IsAutoStartEnabled();
             _autoStartCheck.CheckedChanged += delegate
             {
-                if (!SetAutoStartEnabled(_autoStartCheck.Checked))
+                if (!_syncingAutoStartUi)
                 {
-                    _autoStartCheck.Checked = IsAutoStartEnabled();
+                    ToggleAutoStart(_autoStartCheck.Checked);
                 }
             };
             Controls.Add(_autoStartCheck);
@@ -1540,9 +1596,15 @@ namespace OmniDeskAgent
             stopBtn.Click += delegate { Close(); };
             Controls.Add(stopBtn);
 
+            _trayAutoStartItem = new MenuItem();
+            _trayAutoStartItem.Click += delegate { ToggleAutoStart(!IsAutoStartEnabled()); };
+
             ContextMenu trayMenu = new ContextMenu();
-            trayMenu.MenuItems.Add("Abrir Janela OmniDesk", delegate { ShowFromTray(); });
+            trayMenu.MenuItems.Add("Abrir Painel OmniDesk", delegate { ShowFromTray(); });
+            trayMenu.MenuItems.Add(_trayAutoStartItem);
             trayMenu.MenuItems.Add("Encerrar Agente", delegate { Close(); });
+
+            SyncAutoStartUi(IsAutoStartEnabled());
 
             _trayIcon = new NotifyIcon();
             _trayIcon.Icon = SystemIcons.Application;
@@ -1629,6 +1691,59 @@ namespace OmniDeskAgent
                 _server.PollClipboard();
             }
             base.WndProc(ref m);
+        }
+
+        private void ToggleAutoStart(bool enable)
+        {
+            SetAutoStartEnabled(enable);
+            SyncAutoStartUi(IsAutoStartEnabled());
+        }
+
+        private void SyncAutoStartUi(bool enabled)
+        {
+            _syncingAutoStartUi = true;
+            try
+            {
+                if (_autoStartCheck != null)
+                {
+                    _autoStartCheck.Checked = enabled;
+                }
+                if (_trayAutoStartItem != null)
+                {
+                    _trayAutoStartItem.Checked = enabled;
+                    _trayAutoStartItem.Text = enabled
+                        ? "Iniciar automaticamente com o Windows (Ativado)"
+                        : "Iniciar automaticamente com o Windows (Desativado)";
+                }
+            }
+            finally
+            {
+                _syncingAutoStartUi = false;
+            }
+        }
+
+        private static void EnsureAutoStartConfiguredOnFirstRun()
+        {
+            try
+            {
+                using (RegistryKey prefs = Registry.CurrentUser.OpenSubKey(AgentPrefsRegistryPath, false))
+                {
+                    if (prefs != null && prefs.GetValue(AutoStartConfiguredValueName) != null)
+                    {
+                        return;
+                    }
+                }
+
+                SetAutoStartEnabled(true);
+                using (RegistryKey writePrefs = Registry.CurrentUser.CreateSubKey(AgentPrefsRegistryPath))
+                {
+                    if (writePrefs != null)
+                    {
+                        writePrefs.SetValue(AutoStartConfiguredValueName, 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
         }
 
         private static bool IsAutoStartEnabled()

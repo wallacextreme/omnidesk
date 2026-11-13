@@ -533,17 +533,22 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
         return Boolean(v && v.videoWidth > 0);
       }, null, { timeout: 15000 });
 
-      // Move pointer over center of active video -> single cursor (cursor-none) must activate!
+      // Hardware cursor (cursor-default) stays active with zero fake HTML cursor overlay;
+      // clicking the HUD cursor toggle can still hide/restore local cursor for legacy capture drivers.
       const captureOverlay = pageClient.locator('[data-testid="remote-input-capture"]');
       const box = await captureOverlay.boundingBox();
       if (!box) throw new Error("Missing capture overlay boundingBox");
       await pageClient.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
 
+      await expect(captureOverlay).toHaveClass(/cursor-default/, { timeout: 5000 });
+
+      await pageClient.locator('[data-testid="toggle-cursor-btn"]').click();
+      await pageClient.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await expect(captureOverlay).toHaveClass(/cursor-none/, { timeout: 5000 });
 
-      // Toggling Cursor Duplo restores cursor-default cleanly
       await pageClient.locator('[data-testid="toggle-cursor-btn"]').click();
-      await expect(captureOverlay).toHaveClass(/cursor-default/);
+      await pageClient.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await expect(captureOverlay).toHaveClass(/cursor-default/, { timeout: 5000 });
 
       // 1. Ctrl+V text paste event syncs text to Host Windows Agent
       await pageClient.evaluate(() => {

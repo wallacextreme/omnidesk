@@ -121,19 +121,19 @@ export class WebRTCManager {
     }
     if (this.qualityPreset === "original") {
       return {
-        maxBitrate: 10_000_000,
+        maxBitrate: 12_000_000,
         maxFramerate: 60,
-        startBitrateKbps: 5000,
+        startBitrateKbps: 6000,
         minBitrateKbps: 1500,
-        maxBitrateKbps: 10000,
+        maxBitrateKbps: 12000,
       };
     }
     return {
-      maxBitrate: 4_500_000,
+      maxBitrate: 8_000_000,
       maxFramerate: 60,
-      startBitrateKbps: 2500,
-      minBitrateKbps: 800,
-      maxBitrateKbps: 4500,
+      startBitrateKbps: 4000,
+      minBitrateKbps: 1000,
+      maxBitrateKbps: 8000,
     };
   }
 

@@ -2,6 +2,7 @@ import {
   parseControlPacket,
   parseTransferPacket,
   type ControlChannelPacket,
+  type StreamQualityPreset,
   type TransferChannelPacket,
   type WebRTCSignalPayload,
   type RTCIceCandidateInitLike,
@@ -95,6 +96,136 @@ export class WebRTCManager {
   private makingOffer = false;
   private epoch = 0;
   private signalQueue: Promise<void> = Promise.resolve();
+  private qualityPreset: StreamQualityPreset = "balanced";
+
+  public setQualityPreset(preset: StreamQualityPreset): void {
+    this.qualityPreset = preset;
+    void this.applyVideoSenderParameters();
+  }
+
+  private getQualityConstraints(): {
+    maxBitrate: number;
+    maxFramerate: number;
+    startBitrateKbps: number;
+    minBitrateKbps: number;
+    maxBitrateKbps: number;
+  } {
+    if (this.qualityPreset === "performance") {
+      return {
+        maxBitrate: 1_800_000,
+        maxFramerate: 30,
+        startBitrateKbps: 1200,
+        minBitrateKbps: 400,
+        maxBitrateKbps: 1800,
+      };
+    }
+    if (this.qualityPreset === "original") {
+      return {
+        maxBitrate: 10_000_000,
+        maxFramerate: 60,
+        startBitrateKbps: 5000,
+        minBitrateKbps: 1500,
+        maxBitrateKbps: 10000,
+      };
+    }
+    return {
+      maxBitrate: 4_500_000,
+      maxFramerate: 60,
+      startBitrateKbps: 2500,
+      minBitrateKbps: 800,
+      maxBitrateKbps: 4500,
+    };
+  }
+
+  public async applyVideoSenderParameters(): Promise<void> {
+    if (!this.pc) return;
+    const { maxBitrate, maxFramerate } = this.getQualityConstraints();
+    const senders = this.pc.getSenders();
+    for (const sender of senders) {
+      if (sender.track?.kind !== "video") continue;
+      if ("contentHint" in sender.track) {
+        sender.track.contentHint = "detail";
+      }
+      try {
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        const firstEncoding = params.encodings[0];
+        if (firstEncoding) {
+          firstEncoding.maxBitrate = maxBitrate;
+          firstEncoding.maxFramerate = maxFramerate;
+        }
+        params.degradationPreference = "maintain-resolution";
+        await sender.setParameters(params);
+      } catch {
+        // Fallback if browser rejects degradationPreference
+        try {
+          const fallbackParams = sender.getParameters();
+          if (!fallbackParams.encodings || fallbackParams.encodings.length === 0) {
+            fallbackParams.encodings = [{}];
+          }
+          const enc = fallbackParams.encodings[0];
+          if (enc) {
+            enc.maxBitrate = maxBitrate;
+          }
+          await sender.setParameters(fallbackParams);
+        } catch {
+          // Ignore unsupported runtime parameter changes
+        }
+      }
+    }
+  }
+
+  private enhanceVideoSdpBitrate(sdp: string): string {
+    const { startBitrateKbps, minBitrateKbps, maxBitrateKbps } = this.getQualityConstraints();
+    const lines = sdp.split("\r\n");
+    const out: string[] = [];
+    let inVideoSection = false;
+    let videoPayloads = new Set<string>();
+    let addedBandwidthInSection = false;
+
+    for (const line of lines) {
+      if (line.startsWith("m=")) {
+        inVideoSection = line.startsWith("m=video ");
+        addedBandwidthInSection = false;
+        if (inVideoSection) {
+          const parts = line.trim().split(/\s+/);
+          videoPayloads = new Set(parts.slice(3));
+        }
+        out.push(line);
+        continue;
+      }
+
+      if (inVideoSection && line.startsWith("b=AS:")) {
+        addedBandwidthInSection = true;
+        out.push(`b=AS:${maxBitrateKbps}`);
+        continue;
+      }
+
+      if (inVideoSection && line.startsWith("c=IN ") && !addedBandwidthInSection) {
+        out.push(line);
+        out.push(`b=AS:${maxBitrateKbps}`);
+        addedBandwidthInSection = true;
+        continue;
+      }
+
+      if (inVideoSection && line.startsWith("a=fmtp:")) {
+        const match = /^a=fmtp:(\d+)\s*(.*)$/.exec(line);
+        if (match) {
+          const pt = match[1] ?? "";
+          const params = match[2] ?? "";
+          if (videoPayloads.has(pt) && !params.includes("apt=") && !params.includes("x-google-start-bitrate")) {
+            const extra = `x-google-min-bitrate=${minBitrateKbps};x-google-start-bitrate=${startBitrateKbps};x-google-max-bitrate=${maxBitrateKbps}`;
+            out.push(params ? `a=fmtp:${pt} ${params};${extra}` : `a=fmtp:${pt} ${extra}`);
+            continue;
+          }
+        }
+      }
+      out.push(line);
+    }
+    return out.join("\r\n");
+  }
 
   constructor(callbacks: WebRTCManagerCallbacks) {
     this.callbacks = callbacks;
@@ -286,6 +417,9 @@ export class WebRTCManager {
     this.makingOffer = true;
     try {
       const offer = await this.pc.createOffer();
+      if (offer.sdp) {
+        offer.sdp = this.enhanceVideoSdpBitrate(offer.sdp);
+      }
       await this.pc.setLocalDescription(offer);
       if (offer.sdp) {
         this.callbacks.onSignal({
@@ -355,6 +489,9 @@ export class WebRTCManager {
             );
             await this.drainPendingIceCandidates();
             const answer = await this.pc.createAnswer();
+            if (answer.sdp && this.role === "host") {
+              answer.sdp = this.enhanceVideoSdpBitrate(answer.sdp);
+            }
             await this.pc.setLocalDescription(answer);
             if (answer.sdp) {
               this.callbacks.onSignal({
@@ -521,6 +658,7 @@ export class WebRTCManager {
   }
 
   private prioritizeLightweightCodecs(): void {
+    void this.applyVideoSenderParameters();
     if (
       typeof RTCRtpSender !== "undefined" &&
       typeof RTCRtpSender.getCapabilities === "function" &&

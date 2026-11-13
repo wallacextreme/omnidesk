@@ -1,4 +1,4 @@
-const CACHE_NAME = "omnidesk-v3";
+const CACHE_NAME = "omnidesk-v4";
 const STATIC_ASSETS = ["/", "/index.html", "/manifest.json"];
 
 self.addEventListener("install", (event) => {

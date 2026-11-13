@@ -210,6 +210,11 @@ export class NativeBridge implements INativeBridge {
           clearTimeout(timeout);
           this.probeInFlight = false;
           this.agentWs = ws;
+          ws.onmessage = (ev) => {
+            if (typeof ev.data === "string") {
+              this.handleAgentWsMessage(ev.data);
+            }
+          };
           this.setControlStatus("agent-connected");
           resolve(true);
         };
@@ -345,7 +350,7 @@ export class NativeBridge implements INativeBridge {
       if (stream) {
         const videoTrack = stream.getVideoTracks()[0];
         if (videoTrack && "contentHint" in videoTrack) {
-          videoTrack.contentHint = "motion";
+          videoTrack.contentHint = "detail";
         }
         return stream;
       }
@@ -494,7 +499,292 @@ export class NativeBridge implements INativeBridge {
     return "";
   }
 
+  private agentEventListeners = new Set<
+    (
+      event:
+        | { kind: "clipboard-text"; text: string }
+        | {
+            kind: "clipboard-files";
+            files: Array<{ id: string; name: string; size: number; mimeType: string }>;
+          }
+        | { kind: "file-saved"; path: string; name: string; autoPaste: boolean }
+        | {
+            kind: "agent-clipboard-file-ready";
+            id: string;
+            name: string;
+            mimeType: string;
+            size: number;
+            data: ArrayBuffer;
+          }
+    ) => void
+  >();
+
+  private incomingAgentFiles = new Map<
+    string,
+    {
+      id: string;
+      name: string;
+      mimeType: string;
+      size: number;
+      totalChunks: number;
+      chunks: Array<Uint8Array | undefined>;
+    }
+  >();
+
+  public subscribeAgentEvents(
+    listener: (
+      event:
+        | { kind: "clipboard-text"; text: string }
+        | {
+            kind: "clipboard-files";
+            files: Array<{ id: string; name: string; size: number; mimeType: string }>;
+          }
+        | { kind: "file-saved"; path: string; name: string; autoPaste: boolean }
+        | {
+            kind: "agent-clipboard-file-ready";
+            id: string;
+            name: string;
+            mimeType: string;
+            size: number;
+            data: ArrayBuffer;
+          }
+    ) => void
+  ): () => void {
+    this.agentEventListeners.add(listener);
+    return () => {
+      this.agentEventListeners.delete(listener);
+    };
+  }
+
+  private emitAgentEvent(
+    event:
+      | { kind: "clipboard-text"; text: string }
+      | {
+          kind: "clipboard-files";
+          files: Array<{ id: string; name: string; size: number; mimeType: string }>;
+        }
+      | { kind: "file-saved"; path: string; name: string; autoPaste: boolean }
+      | {
+          kind: "agent-clipboard-file-ready";
+          id: string;
+          name: string;
+          mimeType: string;
+          size: number;
+          data: ArrayBuffer;
+        }
+  ): void {
+    this.agentEventListeners.forEach((cb) => {
+      try {
+        cb(event);
+      } catch {
+        // Ignore listener errors
+      }
+    });
+  }
+
+  private bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+      binary += String.fromCharCode.apply(null, Array.from(slice));
+    }
+    return btoa(binary);
+  }
+
+  private base64ToBytes(b64: string): Uint8Array {
+    const binary = atob(b64);
+    const len = binary.length;
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  }
+
+  private handleAgentWsMessage(raw: string): void {
+    try {
+      const msg = JSON.parse(raw) as Record<string, unknown>;
+      const kind = msg.kind;
+      if (kind === "clipboard-text" && typeof msg.text === "string") {
+        this.emitAgentEvent({ kind: "clipboard-text", text: msg.text });
+        return;
+      }
+      if (kind === "clipboard-files" && Array.isArray(msg.files)) {
+        const files: Array<{ id: string; name: string; size: number; mimeType: string }> = [];
+        for (const item of msg.files) {
+          if (item && typeof item === "object") {
+            const rec = item as Record<string, unknown>;
+            if (
+              typeof rec.id === "string" &&
+              typeof rec.name === "string" &&
+              typeof rec.size === "number"
+            ) {
+              files.push({
+                id: rec.id,
+                name: rec.name,
+                size: rec.size,
+                mimeType:
+                  typeof rec.mimeType === "string" && rec.mimeType
+                    ? rec.mimeType
+                    : "application/octet-stream",
+              });
+            }
+          }
+        }
+        if (files.length > 0) {
+          this.emitAgentEvent({ kind: "clipboard-files", files });
+        }
+        return;
+      }
+      if (kind === "file-saved" && typeof msg.name === "string" && typeof msg.path === "string") {
+        this.emitAgentEvent({
+          kind: "file-saved",
+          path: msg.path,
+          name: msg.name,
+          autoPaste: msg.autoPaste === true,
+        });
+        return;
+      }
+      if (
+        kind === "agent-file-start" &&
+        typeof msg.id === "string" &&
+        typeof msg.name === "string" &&
+        typeof msg.size === "number" &&
+        typeof msg.totalChunks === "number"
+      ) {
+        this.incomingAgentFiles.set(msg.id, {
+          id: msg.id,
+          name: msg.name,
+          mimeType:
+            typeof msg.mimeType === "string" && msg.mimeType
+              ? msg.mimeType
+              : "application/octet-stream",
+          size: msg.size,
+          totalChunks: Math.max(0, msg.totalChunks),
+          chunks: new Array<Uint8Array | undefined>(Math.max(0, msg.totalChunks)),
+        });
+        return;
+      }
+      if (
+        kind === "agent-file-chunk" &&
+        typeof msg.id === "string" &&
+        typeof msg.index === "number" &&
+        typeof msg.dataB64 === "string"
+      ) {
+        const entry = this.incomingAgentFiles.get(msg.id);
+        if (entry && msg.index >= 0) {
+          entry.chunks[msg.index] = this.base64ToBytes(msg.dataB64);
+        }
+        return;
+      }
+      if (kind === "agent-file-end" && typeof msg.id === "string") {
+        const entry = this.incomingAgentFiles.get(msg.id);
+        this.incomingAgentFiles.delete(msg.id);
+        if (!entry) return;
+        let totalBytes = 0;
+        for (const c of entry.chunks) {
+          if (c) totalBytes += c.length;
+        }
+        const assembled = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const c of entry.chunks) {
+          if (!c) continue;
+          assembled.set(c, offset);
+          offset += c.length;
+        }
+        const buffer = assembled.buffer.slice(
+          assembled.byteOffset,
+          assembled.byteOffset + assembled.byteLength
+        );
+        this.emitAgentEvent({
+          kind: "agent-clipboard-file-ready",
+          id: entry.id,
+          name: entry.name,
+          mimeType: entry.mimeType,
+          size: totalBytes,
+          data: buffer,
+        });
+      }
+    } catch {
+      // Ignore malformed messages from local agent
+    }
+  }
+
+  public requestAgentClipboardFile(fileId: string): boolean {
+    if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this.agentWs.send(JSON.stringify({ kind: "request-clipboard-file", id: fileId }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public async saveReceivedFileToAgent(
+    fileName: string,
+    data: ArrayBuffer,
+    autoPaste = false
+  ): Promise<boolean> {
+    if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      const ws = this.agentWs;
+      const bytes = new Uint8Array(data);
+      const chunkBytes = 64 * 1024;
+      const totalChunks = Math.max(1, Math.ceil(bytes.length / chunkBytes));
+      const fileId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+      ws.send(
+        JSON.stringify({
+          kind: "save-file-start",
+          fileId,
+          fileName,
+          totalSize: bytes.length,
+          totalChunks,
+          autoPaste,
+        })
+      );
+
+      for (let i = 0; i < totalChunks; i++) {
+        if (ws.readyState !== WebSocket.OPEN) return false;
+        const start = i * chunkBytes;
+        const end = Math.min(start + chunkBytes, bytes.length);
+        const slice = bytes.subarray(start, end);
+        ws.send(
+          JSON.stringify({
+            kind: "save-file-chunk",
+            fileId,
+            index: i,
+            dataB64: this.bytesToBase64(slice),
+          })
+        );
+        if (i % 16 === 15) {
+          await new Promise((r) => setTimeout(r, 4));
+        }
+      }
+
+      if (ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify({ kind: "save-file-end", fileId }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   public async writeClipboard(text: string): Promise<boolean> {
+    let wroteViaAgent = false;
+    if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
+      try {
+        this.agentWs.send(JSON.stringify({ kind: "set-clipboard-text", text }));
+        wroteViaAgent = true;
+      } catch {
+        // Ignore and continue to browser clipboard
+      }
+    }
     if (this.isDesktopApp() && window.__TAURI__?.core) {
       try {
         await window.__TAURI__.core.invoke("write_clipboard", { text });
@@ -504,6 +794,11 @@ export class NativeBridge implements INativeBridge {
       }
     }
     if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      if (wroteViaAgent) {
+        // Best-effort browser clipboard sync alongside OS agent
+        navigator.clipboard.writeText(text).catch(() => {});
+        return true;
+      }
       try {
         await navigator.clipboard.writeText(text);
         return true;
@@ -587,7 +882,7 @@ export class NativeBridge implements INativeBridge {
     const stream = canvas.captureStream(60);
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack && "contentHint" in videoTrack) {
-      videoTrack.contentHint = "motion";
+      videoTrack.contentHint = "detail";
     }
     return stream;
   }

@@ -34,8 +34,33 @@ import {
   type ControlChannelPacket,
   type InputPacket,
   type SignalingMessage,
+  type StreamQualityPreset,
+  type TransferChannelPacket,
   type WebRTCSignalPayload,
 } from "./shared/protocol";
+
+function triggerBrowserDownload(file: { name: string; blob: Blob }): void {
+  if (typeof document === "undefined" || typeof URL === "undefined") return;
+  try {
+    const url = URL.createObjectURL(file.blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.name;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }, 2000);
+  } catch {
+    // Ignore auto-download failures in constrained environments
+  }
+}
 
 const FRAME_CHUNK_SIZE = 20_000;
 const DIRECT_FRAME_LIMIT = 24_000;
@@ -150,6 +175,19 @@ export const App: React.FC = () => {
   const [receivedFiles, setReceivedFiles] = useState<
     Array<{ name: string; size: number; blob: Blob; sha256: string }>
   >([]);
+  const [lastSyncedClipboardText, setLastSyncedClipboardText] = useState<string>("");
+  const lastSyncedClipboardTextRef = useRef<string>("");
+  const [statusBanner, setStatusBanner] = useState<{
+    id: string;
+    text: string;
+    actionLabel?: string;
+    onAction?: () => void;
+  } | null>(null);
+  const statusBannerTimerRef = useRef<number | null>(null);
+  const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const hostClipboardFilesMapRef = useRef<
+    Map<string, { name: string; size: number; mimeType: string; autoSend: boolean }>
+  >(new Map());
 
   // Recent Sessions History
   const [recentSessions, setRecentSessions] = useState<RecentSession[]>(() => {
@@ -346,6 +384,11 @@ export const App: React.FC = () => {
         return; // Dropped by Zero-Trust ACL Guard
       }
 
+      if (packet.kind === "stream-quality") {
+        webrtcRef.current?.setQualityPreset(packet.quality);
+        return;
+      }
+
       if (packet.kind === "chat-message") {
         setChatMessages((prev) => [...prev, packet]);
         return;
@@ -367,6 +410,131 @@ export const App: React.FC = () => {
       }
     }
   }, []);
+
+  const showStatusBanner = useCallback(
+    (
+      text: string,
+      options?: { actionLabel?: string; onAction?: () => void; durationMs?: number }
+    ) => {
+      if (statusBannerTimerRef.current !== null) {
+        window.clearTimeout(statusBannerTimerRef.current);
+        statusBannerTimerRef.current = null;
+      }
+      const next: {
+        id: string;
+        text: string;
+        actionLabel?: string;
+        onAction?: () => void;
+      } = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        text,
+      };
+      if (options?.actionLabel) next.actionLabel = options.actionLabel;
+      if (options?.onAction) next.onAction = options.onAction;
+      setStatusBanner(next);
+
+      const durationMs = options?.durationMs ?? 4500;
+      if (durationMs > 0) {
+        statusBannerTimerRef.current = window.setTimeout(() => {
+          statusBannerTimerRef.current = null;
+          setStatusBanner(null);
+        }, durationMs);
+      }
+    },
+    []
+  );
+
+  const sendTransferPacketWithFallback = useCallback(
+    (packet: TransferChannelPacket): boolean => {
+      const sentViaWebRTC = webrtcRef.current?.sendTransferPacket(packet) ?? false;
+      if (sentViaWebRTC) return true;
+      if (remotePeerIdRef.current && deviceIdRef.current) {
+        sendSignaling({
+          type: "transfer-relay",
+          targetId: remotePeerIdRef.current,
+          senderId: deviceIdRef.current,
+          packet,
+        });
+        return true;
+      }
+      return false;
+    },
+    [sendSignaling]
+  );
+
+  const handleIncomingTransferPacket = useCallback(
+    (role: "host" | "client", packet: TransferChannelPacket) => {
+      if (role === "host" && !aclGuardRef.current.canExecuteTransferPacket(packet)) {
+        return; // Dropped by ACL Guard
+      }
+
+      if (packet.kind === "clipboard-sync") {
+        if (role === "client" && !activeAclRef.current.allowClipboard) return;
+        if (packet.text === lastSyncedClipboardTextRef.current) return;
+        lastSyncedClipboardTextRef.current = packet.text;
+        setLastSyncedClipboardText(packet.text);
+        void nativeBridge.writeClipboard(packet.text).then((ok) => {
+          if (ok) {
+            showStatusBanner("Área de transferência sincronizada", { durationMs: 2500 });
+          } else {
+            showStatusBanner("Texto recebido do dispositivo remoto", {
+              actionLabel: "Copiar texto",
+              durationMs: 8000,
+              onAction: () => {
+                void nativeBridge.writeClipboard(packet.text);
+                setStatusBanner(null);
+              },
+            });
+          }
+        });
+        return;
+      }
+
+      if (packet.kind === "clipboard-files-ready") {
+        if (role === "client" && !activeAclRef.current.allowFileTransfer) return;
+        const first = packet.files[0];
+        if (!first) return;
+        const totalSizeMb = (
+          packet.files.reduce((sum, f) => sum + f.size, 0) /
+          (1024 * 1024)
+        ).toFixed(1);
+        const label =
+          packet.files.length === 1
+            ? `${first.name} (${totalSizeMb} MB)`
+            : `${packet.files.length} arquivos no Host (${totalSizeMb} MB)`;
+        showStatusBanner(`Pronto para copiar do Host: ${label}`, {
+          actionLabel: "Baixar",
+          durationMs: 12000,
+          onAction: () => {
+            for (const f of packet.files) {
+              sendTransferPacketWithFallback({
+                kind: "clipboard-file-request",
+                id: f.id,
+              });
+            }
+            showStatusBanner("Solicitando arquivos ao Host...");
+          },
+        });
+        return;
+      }
+
+      if (packet.kind === "clipboard-file-request") {
+        if (role !== "host") return;
+        const entry = hostClipboardFilesMapRef.current.get(packet.id);
+        if (entry) {
+          entry.autoSend = true;
+        }
+        nativeBridge.requestAgentClipboardFile(packet.id);
+        return;
+      }
+
+      fileReceiverRef.current?.handlePacket(packet);
+    },
+    [sendTransferPacketWithFallback, showStatusBanner]
+  );
+
+  const handleIncomingTransferPacketRef = useRef(handleIncomingTransferPacket);
+  handleIncomingTransferPacketRef.current = handleIncomingTransferPacket;
 
   const sendControlPacketWithFallback = useCallback(
     (packet: ControlChannelPacket) => {
@@ -492,25 +660,49 @@ export const App: React.FC = () => {
           handleIncomingControlPacket(role, packet);
         },
         onTransferPacket: (packet) => {
-          if (role === "host" && !aclGuardRef.current.canExecuteTransferPacket(packet)) {
-            return; // Dropped by ACL Guard
-          }
-          fileReceiverRef.current?.handlePacket(packet);
+          handleIncomingTransferPacketRef.current(role, packet);
         },
       });
 
-      // File transfer handlers
+      // File transfer handlers (WebRTC DataChannel with transparent WSS fallback)
       fileSenderRef.current = new FileSender({
-        sendPacket: (pkt) => manager.sendTransferPacket(pkt),
+        sendPacket: (pkt) => sendTransferPacketWithFallback(pkt),
         getBufferedAmount: () => manager.getTransferBufferedAmount(),
         onProgress: (prog) => setActiveTransferProgress({ ...prog }),
       });
 
       fileReceiverRef.current = new FileReceiver({
-        sendPacket: (pkt) => manager.sendTransferPacket(pkt),
+        sendPacket: (pkt) => sendTransferPacketWithFallback(pkt),
         onProgress: (prog) => setActiveTransferProgress({ ...prog }),
         onFileReceived: (file) => {
-          setReceivedFiles((prev) => [file, ...prev]);
+          setReceivedFiles((prev) => [
+            { name: file.name, size: file.size, blob: file.blob, sha256: file.sha256 },
+            ...prev,
+          ]);
+          void (async () => {
+            if (nativeBridge.getControlStatus() === "agent-connected") {
+              try {
+                const buf = await file.blob.arrayBuffer();
+                const savedOk = await nativeBridge.saveReceivedFileToAgent(
+                  file.name,
+                  buf,
+                  Boolean(file.autoPaste)
+                );
+                if (savedOk) {
+                  showStatusBanner(
+                    file.autoPaste
+                      ? `Colado no Windows: ${file.name}`
+                      : `Salvo em Downloads\\OmniDesk: ${file.name}`
+                  );
+                  return;
+                }
+              } catch {
+                // Fall back to browser download
+              }
+            }
+            triggerBrowserDownload(file);
+            showStatusBanner(`Arquivo recebido: ${file.name}`);
+          })();
         },
       });
 
@@ -805,6 +997,19 @@ export const App: React.FC = () => {
                 break;
               }
 
+              case "transfer-relay": {
+                if (
+                  sessionRoleRef.current === "host" ||
+                  sessionRoleRef.current === "client"
+                ) {
+                  handleIncomingTransferPacketRef.current(
+                    sessionRoleRef.current,
+                    msg.packet
+                  );
+                }
+                break;
+              }
+
               case "webrtc-signal": {
                 if (webrtcRef.current) {
                   await webrtcRef.current.handleRemoteSignal(msg.signal);
@@ -845,6 +1050,10 @@ export const App: React.FC = () => {
 
   // Client Initiates Connection
   const handleConnect = (targetRaw: string, password?: string) => {
+    if (!deviceIdRef.current) {
+      showStatusBanner("Aguardando este dispositivo ficar Online para conectar...");
+      return;
+    }
     const targetId = normalizeDeviceId(targetRaw);
     if (!targetId || targetId === deviceIdRef.current) {
       alert(
@@ -1021,18 +1230,131 @@ export const App: React.FC = () => {
     [deviceName, sendControlPacketWithFallback]
   );
 
-  // Send File
-  const handleSendFile = async (file: File) => {
-    if (!fileSenderRef.current || !activeAcl.allowFileTransfer) {
-      alert("Transferência de arquivos não permitida pelo Host nesta sessão.");
-      return;
-    }
-    try {
-      await fileSenderRef.current.sendFile(file);
-    } catch (err) {
-      console.error("[App] Send file failed:", err);
-    }
-  };
+  // Sync local clipboard text to Host/Client
+  const handleSyncClipboardText = useCallback(
+    (text: string) => {
+      if (!activeAclRef.current.allowClipboard) return;
+      lastSyncedClipboardTextRef.current = text;
+      setLastSyncedClipboardText(text);
+      sendTransferPacketWithFallback({
+        kind: "clipboard-sync",
+        text,
+        timestamp: Date.now(),
+      });
+    },
+    [sendTransferPacketWithFallback]
+  );
+
+  // Change stream quality preset on Host encoder
+  const handleChangeQuality = useCallback(
+    (quality: StreamQualityPreset) => {
+      sendControlPacketWithFallback({ kind: "stream-quality", quality });
+    },
+    [sendControlPacketWithFallback]
+  );
+
+  // Send 1 or more files sequentially (supports drag & drop and Ctrl+V auto-paste)
+  const handleSendFiles = useCallback(
+    async (files: File[], options?: { autoPaste?: boolean }) => {
+      if (!fileSenderRef.current || !activeAclRef.current.allowFileTransfer) {
+        showStatusBanner(
+          "Transferência de arquivos não permitida pelo Host nesta sessão.",
+          { durationMs: 4000 }
+        );
+        return;
+      }
+      for (const file of files) {
+        sendQueueRef.current = sendQueueRef.current.then(async () => {
+          if (!fileSenderRef.current) return;
+          try {
+            showStatusBanner(`Enviando ${file.name}...`, { durationMs: 0 });
+            await fileSenderRef.current.sendFile(file, options);
+            showStatusBanner(
+              options?.autoPaste
+                ? `Arquivo enviado e colado no Host: ${file.name}`
+                : `Arquivo enviado: ${file.name}`
+            );
+          } catch (err) {
+            console.error("[App] Send file failed:", err);
+            showStatusBanner(`Falha ao enviar ${file.name}`);
+          }
+        });
+      }
+    },
+    [showStatusBanner]
+  );
+
+  const handleSendFile = useCallback(
+    (file: File) => {
+      void handleSendFiles([file], { autoPaste: false });
+    },
+    [handleSendFiles]
+  );
+
+  // Subscribe Host to OmniDesk Windows Agent clipboard events (Ctrl+C text & Explorer files)
+  useEffect(() => {
+    if (!sessionActive || sessionRole !== "host") return;
+
+    const unsubscribe = nativeBridge.subscribeAgentEvents((event) => {
+      if (event.kind === "clipboard-text") {
+        if (!aclGuardRef.current.canSyncClipboard()) return;
+        if (event.text === lastSyncedClipboardTextRef.current) return;
+        lastSyncedClipboardTextRef.current = event.text;
+        setLastSyncedClipboardText(event.text);
+        sendTransferPacketWithFallback({
+          kind: "clipboard-sync",
+          text: event.text,
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      if (event.kind === "clipboard-files") {
+        if (!aclGuardRef.current.canTransferFile()) return;
+        const totalSize = event.files.reduce((sum, f) => sum + f.size, 0);
+        const autoSend = totalSize <= 25 * 1024 * 1024;
+        for (const f of event.files) {
+          hostClipboardFilesMapRef.current.set(f.id, {
+            name: f.name,
+            size: f.size,
+            mimeType: f.mimeType,
+            autoSend,
+          });
+          if (autoSend) {
+            nativeBridge.requestAgentClipboardFile(f.id);
+          }
+        }
+        if (!autoSend) {
+          sendTransferPacketWithFallback({
+            kind: "clipboard-files-ready",
+            files: event.files,
+          });
+        }
+        return;
+      }
+
+      if (event.kind === "agent-clipboard-file-ready") {
+        if (!aclGuardRef.current.canTransferFile()) return;
+        const entry = hostClipboardFilesMapRef.current.get(event.id);
+        if (!entry?.autoSend) return;
+        const fileObj = new File([event.data], event.name, {
+          type: event.mimeType || "application/octet-stream",
+        });
+        void handleSendFiles([fileObj], { autoPaste: false });
+        return;
+      }
+
+      if (event.kind === "file-saved") {
+        showStatusBanner(
+          event.autoPaste
+            ? `Colado via Ctrl+V no Windows: ${event.name}`
+            : `Salvo em Downloads\\OmniDesk: ${event.name}`
+        );
+      }
+    });
+
+    return unsubscribe;
+  }, [sessionActive, sessionRole, sendTransferPacketWithFallback, handleSendFiles, showStatusBanner]);
 
   // Toggle Synthetic Stream
   const handleToggleSyntheticStream = (enabled: boolean) => {
@@ -1095,6 +1417,10 @@ export const App: React.FC = () => {
       setActiveTransferProgress(null);
       setHostChatOpen(false);
       setHostFilesOpen(false);
+      setStatusBanner(null);
+      setLastSyncedClipboardText("");
+      lastSyncedClipboardTextRef.current = "";
+      hostClipboardFilesMapRef.current.clear();
     },
     [sendSignaling]
   );
@@ -1154,6 +1480,12 @@ export const App: React.FC = () => {
           localSenderName={deviceName}
           activeTransferProgress={activeTransferProgress}
           onSendFile={handleSendFile}
+          onSendFiles={handleSendFiles}
+          onSyncClipboardText={handleSyncClipboardText}
+          onChangeQuality={handleChangeQuality}
+          lastSyncedClipboardText={lastSyncedClipboardText}
+          statusBanner={statusBanner}
+          onDismissStatusBanner={() => setStatusBanner(null)}
           receivedFiles={receivedFiles}
           isHost={false}
         />
@@ -1235,8 +1567,14 @@ export const App: React.FC = () => {
                 onClose={() => setHostFilesOpen(false)}
                 activeProgress={activeTransferProgress}
                 onSendFile={handleSendFile}
+                onSendFiles={(files) => void handleSendFiles(files, { autoPaste: false })}
                 receivedFiles={receivedFiles}
               />
+              {statusBanner && (
+                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/40 shadow-2xl text-xs text-slate-100">
+                  {statusBanner.text}
+                </div>
+              )}
             </>
           )}
         </div>

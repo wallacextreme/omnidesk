@@ -94,7 +94,10 @@ export class FileSender {
     this.isCancelled = true;
   }
 
-  public async sendFile(file: File | { name: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> }): Promise<string> {
+  public async sendFile(
+    file: File | { name: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> },
+    options?: { autoPaste?: boolean }
+  ): Promise<string> {
     this.isCancelled = false;
     const sanitizedName = sanitizeFileName(file.name);
     const transferId = safeRandomUUID();
@@ -114,6 +117,7 @@ export class FileSender {
       fileType: "application/octet-stream",
       totalChunks,
       sha256: fileHash,
+      ...(options?.autoPaste ? { autoPaste: true } : {}),
     };
 
     if (!this.callbacks.sendPacket(metaPacket)) {
@@ -196,7 +200,7 @@ export class FileSender {
 
 export interface FileReceiverCallbacks {
   onProgress?: (progress: FileTransferProgress) => void;
-  onFileReceived?: (file: { name: string; blob: Blob; size: number; sha256: string }) => void;
+  onFileReceived?: (file: { name: string; blob: Blob; size: number; sha256: string; autoPaste?: boolean }) => void;
   onError?: (transferId: string, error: string) => void;
   sendPacket?: (packet: TransferChannelPacket) => boolean;
 }
@@ -337,6 +341,7 @@ export class FileReceiver {
       blob,
       size: meta.fileSize,
       sha256: calculatedHash,
+      ...(meta.autoPaste ? { autoPaste: true } : {}),
     });
 
     const completePacket: FileCompletePacket = {

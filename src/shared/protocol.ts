@@ -299,6 +299,15 @@ export const TelemetryPacketSchema = z.object({
 });
 export type TelemetryPacket = z.infer<typeof TelemetryPacketSchema>;
 
+export const StreamQualityPresetSchema = z.enum(["performance", "balanced", "original"]);
+export type StreamQualityPreset = z.infer<typeof StreamQualityPresetSchema>;
+
+export const StreamQualityPacketSchema = z.object({
+  kind: z.literal("stream-quality"),
+  quality: StreamQualityPresetSchema,
+});
+export type StreamQualityPacket = z.infer<typeof StreamQualityPacketSchema>;
+
 export const ControlChannelPacketSchema = z.discriminatedUnion("kind", [
   MouseMovePacketSchema,
   MouseButtonPacketSchema,
@@ -308,6 +317,7 @@ export const ControlChannelPacketSchema = z.discriminatedUnion("kind", [
   ACLUpdatePacketSchema,
   ChatMessagePacketSchema,
   TelemetryPacketSchema,
+  StreamQualityPacketSchema,
 ]);
 export type ControlChannelPacket = z.infer<typeof ControlChannelPacketSchema>;
 
@@ -319,29 +329,6 @@ export const ControlRelayMsgSchema = z.object({
   packet: ControlChannelPacketSchema,
 });
 export type ControlRelayMsg = z.infer<typeof ControlRelayMsgSchema>;
-
-// Combined Discriminated Union for all Signaling Messages
-export const SignalingMessageSchema = z.discriminatedUnion("type", [
-  RegisterHostMsgSchema,
-  RegisteredMsgSchema,
-  PeerStatusRequestMsgSchema,
-  PeerStatusResponseMsgSchema,
-  SessionRequestMsgSchema,
-  AuthChallengeMsgSchema,
-  AuthResponseMsgSchema,
-  SessionAcceptedMsgSchema,
-  SessionRejectedMsgSchema,
-  WebRTCSignalMsgSchema,
-  SessionCloseMsgSchema,
-  VideoFrameMsgSchema,
-  VideoFrameChunkMsgSchema,
-  VideoStatusMsgSchema,
-  ControlRelayMsgSchema,
-  PingMsgSchema,
-  PongMsgSchema,
-  ErrorMsgSchema,
-]);
-export type SignalingMessage = z.infer<typeof SignalingMessageSchema>;
 
 // ==========================================
 // 5. DATA CHANNEL #2: FILE & CLIPBOARD PACKETS
@@ -355,6 +342,7 @@ export const FileMetadataPacketSchema = z.object({
   fileType: z.string(),
   totalChunks: z.number().int().positive(),
   sha256: z.string().length(64),
+  autoPaste: z.boolean().optional(),
 });
 export type FileMetadataPacket = z.infer<typeof FileMetadataPacketSchema>;
 
@@ -395,6 +383,26 @@ export const ClipboardSyncPacketSchema = z.object({
 });
 export type ClipboardSyncPacket = z.infer<typeof ClipboardSyncPacketSchema>;
 
+export const ClipboardFilesReadyPacketSchema = z.object({
+  kind: z.literal("clipboard-files-ready"),
+  files: z
+    .array(
+      z.object({
+        id: z.string().min(1).max(128),
+        name: z.string().min(1).max(255),
+        size: z.number().int().nonnegative(),
+      })
+    )
+    .max(20),
+});
+export type ClipboardFilesReadyPacket = z.infer<typeof ClipboardFilesReadyPacketSchema>;
+
+export const ClipboardFileRequestPacketSchema = z.object({
+  kind: z.literal("clipboard-file-request"),
+  id: z.string().min(1).max(128),
+});
+export type ClipboardFileRequestPacket = z.infer<typeof ClipboardFileRequestPacketSchema>;
+
 export const TransferChannelPacketSchema = z.discriminatedUnion("kind", [
   FileMetadataPacketSchema,
   FileChunkPacketSchema,
@@ -402,8 +410,43 @@ export const TransferChannelPacketSchema = z.discriminatedUnion("kind", [
   FileCompletePacketSchema,
   FileAbortPacketSchema,
   ClipboardSyncPacketSchema,
+  ClipboardFilesReadyPacketSchema,
+  ClipboardFileRequestPacketSchema,
 ]);
 export type TransferChannelPacket = z.infer<typeof TransferChannelPacketSchema>;
+
+// Fallback Transfer Relay over WSS when WebRTC transfer DataChannel is unavailable
+export const TransferRelayMsgSchema = z.object({
+  type: z.literal("transfer-relay"),
+  targetId: z.string().regex(DEVICE_ID_REGEX),
+  senderId: z.string().length(9),
+  packet: TransferChannelPacketSchema,
+});
+export type TransferRelayMsg = z.infer<typeof TransferRelayMsgSchema>;
+
+// Combined Discriminated Union for all Signaling Messages
+export const SignalingMessageSchema = z.discriminatedUnion("type", [
+  RegisterHostMsgSchema,
+  RegisteredMsgSchema,
+  PeerStatusRequestMsgSchema,
+  PeerStatusResponseMsgSchema,
+  SessionRequestMsgSchema,
+  AuthChallengeMsgSchema,
+  AuthResponseMsgSchema,
+  SessionAcceptedMsgSchema,
+  SessionRejectedMsgSchema,
+  WebRTCSignalMsgSchema,
+  SessionCloseMsgSchema,
+  VideoFrameMsgSchema,
+  VideoFrameChunkMsgSchema,
+  VideoStatusMsgSchema,
+  ControlRelayMsgSchema,
+  TransferRelayMsgSchema,
+  PingMsgSchema,
+  PongMsgSchema,
+  ErrorMsgSchema,
+]);
+export type SignalingMessage = z.infer<typeof SignalingMessageSchema>;
 
 // ==========================================
 // 6. VALIDATION HELPERS

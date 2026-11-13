@@ -3,6 +3,7 @@ import {
   ChevronUp,
   ChevronDown,
   Activity,
+  MousePointer2,
   Sliders,
   ShieldBan,
   ShieldCheck,
@@ -33,6 +34,8 @@ interface SessionHUDProps {
   unreadChatCount: number;
   quality: "performance" | "balanced" | "original";
   onChangeQuality: (q: "performance" | "balanced" | "original") => void;
+  hideLocalCursor?: boolean;
+  onToggleHideLocalCursor?: () => void;
   isHost: boolean;
 }
 
@@ -52,6 +55,8 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
   unreadChatCount,
   quality,
   onChangeQuality,
+  hideLocalCursor = true,
+  onToggleHideLocalCursor,
   isHost,
 }) => {
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -95,14 +100,14 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
       {isCollapsed ? (
         <button
           onClick={() => setIsCollapsed(false)}
-          className="pointer-events-auto flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900/90 border border-slate-700 backdrop-blur-md shadow-2xl text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition whitespace-nowrap"
+          className="pointer-events-auto flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900 border border-slate-700 shadow-2xl text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition whitespace-nowrap"
         >
           <span className={`w-2 h-2 rounded-full ${isFallbackRelay ? "bg-cyan-400" : dotColor}`} />
           <span>{isFallbackRelay ? "WSS Relay" : telemetry.fps === 0 ? "Conectando..." : `${telemetry.rttMs} ms`}</span>
           <ChevronDown className="w-3.5 h-3.5" />
         </button>
       ) : (
-        <div className="pointer-events-auto flex items-center gap-2 p-1.5 rounded-2xl bg-slate-900/90 border border-slate-800/90 backdrop-blur-xl shadow-2xl shadow-black/80 max-w-full overflow-x-auto">
+        <div className="pointer-events-auto flex items-center gap-2 p-1.5 rounded-2xl bg-slate-900 border border-slate-800/90 shadow-2xl shadow-black/80 max-w-full overflow-x-auto">
           {/* Telemetry Indicator */}
           {isFallbackRelay ? (
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium text-cyan-400 bg-cyan-500/10 border-cyan-500/20 whitespace-nowrap shrink-0">
@@ -207,6 +212,29 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
             <Command className="w-3.5 h-3.5 text-cyan-400" />
             <span className="hidden sm:inline">CAD</span>
           </button>
+
+          {/* Local Cursor Toggle (eliminates ghost cursor in WebRTC capture) */}
+          {onToggleHideLocalCursor && (
+            <button
+              data-testid="toggle-cursor-btn"
+              onClick={onToggleHideLocalCursor}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition ${
+                hideLocalCursor
+                  ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                  : "text-slate-300 hover:text-white hover:bg-slate-800"
+              }`}
+              title={
+                hideLocalCursor
+                  ? "Cursor Único ativo (oculta a seta local sobre o vídeo para evitar reflexo)"
+                  : "Mostrar seta local dupla sobre o vídeo"
+              }
+            >
+              <MousePointer2 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">
+                {hideLocalCursor ? "Cursor Único" : "Cursor Duplo"}
+              </span>
+            </button>
+          )}
 
           {/* Chat Toggle */}
           <button

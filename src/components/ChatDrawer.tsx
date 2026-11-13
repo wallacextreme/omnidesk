@@ -36,7 +36,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
   };
 
   return (
-    <div className="fixed top-0 right-0 bottom-0 w-80 sm:w-96 bg-slate-900/95 border-l border-slate-800 backdrop-blur-2xl z-50 flex flex-col shadow-2xl animate-slide-left">
+    <div className="fixed top-0 right-0 bottom-0 w-80 sm:w-96 bg-slate-900 border-l border-slate-800 z-50 flex flex-col shadow-2xl animate-slide-left">
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-slate-800">
         <div className="flex items-center gap-2">

@@ -14,6 +14,7 @@ interface FileTransferDrawerProps {
   onClose: () => void;
   activeProgress: FileTransferProgress | null;
   onSendFile: (file: File) => void;
+  onSendFiles?: (files: File[]) => void;
   receivedFiles: ReceivedFileItem[];
 }
 
@@ -22,6 +23,7 @@ export const FileTransferDrawer: React.FC<FileTransferDrawerProps> = ({
   onClose,
   activeProgress,
   onSendFile,
+  onSendFiles,
   receivedFiles,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -29,12 +31,20 @@ export const FileTransferDrawer: React.FC<FileTransferDrawerProps> = ({
 
   if (!isOpen) return null;
 
+  const dispatchFiles = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const arr = Array.from(fileList);
+    if (onSendFiles) {
+      onSendFiles(arr);
+    } else if (arr[0]) {
+      onSendFile(arr[0]);
+    }
+  };
+
   const handleFileDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      onSendFile(e.dataTransfer.files[0]);
-    }
+    dispatchFiles(e.dataTransfer.files);
   };
 
   const handleDownloadReceived = (file: ReceivedFileItem) => {
@@ -49,7 +59,7 @@ export const FileTransferDrawer: React.FC<FileTransferDrawerProps> = ({
   };
 
   return (
-    <div className="fixed top-0 right-0 bottom-0 w-80 sm:w-96 bg-slate-900/95 border-l border-slate-800 backdrop-blur-2xl z-50 flex flex-col shadow-2xl animate-slide-left">
+    <div className="fixed top-0 right-0 bottom-0 w-80 sm:w-96 bg-slate-900 border-l border-slate-800 z-50 flex flex-col shadow-2xl animate-slide-left">
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-slate-800">
         <div className="flex items-center gap-2">
@@ -78,15 +88,15 @@ export const FileTransferDrawer: React.FC<FileTransferDrawerProps> = ({
         >
           <UploadCloud className="w-10 h-10 text-cyan-400 mb-2 opacity-80" />
           <p className="text-xs font-semibold text-slate-200">Arraste arquivos aqui ou clique</p>
-          <p className="text-[10px] text-slate-500 mt-1">Envio seguro P2P em chunks de 64KB com hash SHA-256</p>
+          <p className="text-[10px] text-slate-500 mt-1">Arraste vários arquivos ou use Ctrl+C / Ctrl+V com hash SHA-256</p>
           <input
             ref={fileInputRef}
             type="file"
+            multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files && e.target.files[0]) {
-                onSendFile(e.target.files[0]);
-              }
+              dispatchFiles(e.target.files);
+              e.target.value = "";
             }}
           />
         </div>

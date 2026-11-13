@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Drawing;
 using System.IO;
 using System.Net;
@@ -9,6 +10,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace OmniDeskAgent
 {
@@ -95,8 +97,16 @@ namespace OmniDeskAgent
         [DllImport("user32.dll")]
         public static extern bool SetCursorPos(int X, int Y);
 
+        public const int WM_CLIPBOARDUPDATE = 0x031D;
+
         [DllImport("user32.dll")]
         public static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool AddClipboardFormatListener(IntPtr hwnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
     }
 
     internal sealed class InputExecutor
@@ -204,16 +214,19 @@ namespace OmniDeskAgent
             }
         }
 
-        private static void SendMouseMove(double x, double y)
-        {
-            int screenW = Math.Max(1, NativeWin32.GetSystemMetrics(0));
-            int screenH = Math.Max(1, NativeWin32.GetSystemMetrics(1));
-            int px = (int)Math.Round(x * (screenW - 1));
-            int py = (int)Math.Round(y * (screenH - 1));
-            NativeWin32.SetCursorPos(px, py);
+        private int _lastAbsX = -1;
+        private int _lastAbsY = -1;
 
+        private void SendMouseMove(double x, double y)
+        {
             int absX = (int)Math.Round(x * 65535.0);
             int absY = (int)Math.Round(y * 65535.0);
+            if (absX == _lastAbsX && absY == _lastAbsY)
+            {
+                return;
+            }
+            _lastAbsX = absX;
+            _lastAbsY = absY;
 
             NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[1];
             inputs[0].type = NativeWin32.INPUT_MOUSE;
@@ -223,7 +236,27 @@ namespace OmniDeskAgent
             NativeWin32.SendInput(1, inputs, NativeWin32.INPUT.Size);
         }
 
-        private static void SendMouseButton(double x, double y, string button, bool isDown)
+        public void TriggerCtrlV()
+        {
+            NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[4];
+            inputs[0].type = NativeWin32.INPUT_KEYBOARD;
+            inputs[0].U.ki.wVk = 0x11; // VK_CONTROL
+            inputs[1].type = NativeWin32.INPUT_KEYBOARD;
+            inputs[1].U.ki.wVk = 0x56; // VK_V
+            inputs[2].type = NativeWin32.INPUT_KEYBOARD;
+            inputs[2].U.ki.wVk = 0x56;
+            inputs[2].U.ki.dwFlags = NativeWin32.KEYEVENTF_KEYUP;
+            inputs[3].type = NativeWin32.INPUT_KEYBOARD;
+            inputs[3].U.ki.wVk = 0x11;
+            inputs[3].U.ki.dwFlags = NativeWin32.KEYEVENTF_KEYUP;
+            NativeWin32.SendInput(4, inputs, NativeWin32.INPUT.Size);
+            lock (_lock)
+            {
+                EventsExecuted++;
+            }
+        }
+
+        private void SendMouseButton(double x, double y, string button, bool isDown)
         {
             SendMouseMove(x, y);
 
@@ -577,10 +610,37 @@ namespace OmniDeskAgent
     internal sealed class LoopbackBridgeServer
     {
         public const int Port = 47831;
+        private sealed class ClientConn
+        {
+            public NetworkStream Stream;
+            public readonly object WriteLock = new object();
+        }
+
+        private sealed class PendingSaveFile
+        {
+            public string FileId;
+            public string SafeName;
+            public string TempPath;
+            public string DestDir;
+            public FileStream Writer;
+            public bool AutoPaste;
+        }
+
         private readonly InputExecutor _executor;
         private TcpListener _listener;
         private volatile bool _running;
         private int _activeClients;
+        private readonly object _clientsLock = new object();
+        private readonly List<ClientConn> _clients = new List<ClientConn>();
+        private Action<Action> _staDispatcher;
+        private readonly object _clipLock = new object();
+        private readonly Dictionary<string, string> _clipboardFilePaths = new Dictionary<string, string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, PendingSaveFile> _pendingSaveFiles = new Dictionary<string, PendingSaveFile>(StringComparer.Ordinal);
+        private string _lastClipboardSignature = "";
+        private string _ignoreNextClipboardText = null;
+        private DateTime _ignoreClipboardUntilUtc = DateTime.MinValue;
+        private int _clipFileSeq = 0;
+
         public event Action<string> StatusChanged;
 
         public int ActiveClients { get { return _activeClients; } }
@@ -588,6 +648,11 @@ namespace OmniDeskAgent
         public LoopbackBridgeServer(InputExecutor executor)
         {
             _executor = executor;
+        }
+
+        public void AttachStaDispatcher(Action<Action> dispatcher)
+        {
+            _staDispatcher = dispatcher;
         }
 
         public void Start()
@@ -609,6 +674,15 @@ namespace OmniDeskAgent
                 if (_listener != null) _listener.Stop();
             }
             catch { }
+            lock (_clipLock)
+            {
+                foreach (KeyValuePair<string, PendingSaveFile> kv in _pendingSaveFiles)
+                {
+                    try { if (kv.Value.Writer != null) kv.Value.Writer.Dispose(); } catch { }
+                    try { if (File.Exists(kv.Value.TempPath)) File.Delete(kv.Value.TempPath); } catch { }
+                }
+                _pendingSaveFiles.Clear();
+            }
             _executor.ReleaseAllHeldInputs();
         }
 
@@ -717,12 +791,28 @@ namespace OmniDeskAgent
                         byte[] hBytes = Encoding.ASCII.GetBytes(handshake);
                         stream.Write(hBytes, 0, hBytes.Length);
 
+                        ClientConn conn = new ClientConn();
+                        conn.Stream = stream;
+                        lock (_clientsLock)
+                        {
+                            _clients.Add(conn);
+                        }
                         isWsClient = true;
                         Interlocked.Increment(ref _activeClients);
                         NotifyStatus();
-                        SendWsText(stream, "{\"type\":\"hello\",\"platform\":\"windows\",\"port\":47831}");
+                        SendWsText(conn, "{\"type\":\"hello\",\"platform\":\"windows\",\"port\":47831}");
 
-                        ProcessWebSocketLoop(stream);
+                        try
+                        {
+                            ProcessWebSocketLoop(conn);
+                        }
+                        finally
+                        {
+                            lock (_clientsLock)
+                            {
+                                _clients.Remove(conn);
+                            }
+                        }
                     }
                     else
                     {
@@ -761,8 +851,12 @@ namespace OmniDeskAgent
             }
         }
 
-        private void ProcessWebSocketLoop(NetworkStream stream)
+        private void ProcessWebSocketLoop(ClientConn conn)
         {
+            NetworkStream stream = conn.Stream;
+            MemoryStream fragBuffer = null;
+            int fragOpcode = 0;
+
             while (_running)
             {
                 int b1 = stream.ReadByte();
@@ -788,7 +882,7 @@ namespace OmniDeskAgent
                                  ((ulong)ext[4] << 24) | ((ulong)ext[5] << 16) | ((ulong)ext[6] << 8) | (ulong)ext[7];
                 }
 
-                if (payloadLen > 1048576) break;
+                if (payloadLen > 8388608) break; // 8 MB frame limit
 
                 byte[] maskKey = null;
                 if (masked)
@@ -814,15 +908,454 @@ namespace OmniDeskAgent
                 }
                 else if (opcode == 0x9)
                 {
-                    SendWsPong(stream, payload);
+                    SendWsPong(conn, payload);
                 }
-                else if (opcode == 0x1 && fin)
+                else if (opcode == 0xA)
                 {
-                    string json = Encoding.UTF8.GetString(payload);
-                    Dictionary<string, string> pkt = FlatJsonParser.ParseObject(json);
-                    _executor.Execute(pkt);
+                    // Pong ignored
+                }
+                else if (opcode == 0x1 || opcode == 0x0)
+                {
+                    byte[] completePayload = null;
+                    int effectiveOpcode = (opcode == 0x0) ? fragOpcode : opcode;
+                    if (!fin)
+                    {
+                        if (opcode == 0x1)
+                        {
+                            fragOpcode = opcode;
+                            if (fragBuffer != null) fragBuffer.Dispose();
+                            fragBuffer = new MemoryStream();
+                        }
+                        if (fragBuffer != null)
+                        {
+                            fragBuffer.Write(payload, 0, payload.Length);
+                            if (fragBuffer.Length > 8388608) break;
+                        }
+                    }
+                    else if (opcode == 0x0)
+                    {
+                        if (fragBuffer != null)
+                        {
+                            fragBuffer.Write(payload, 0, payload.Length);
+                            completePayload = fragBuffer.ToArray();
+                            fragBuffer.Dispose();
+                            fragBuffer = null;
+                            fragOpcode = 0;
+                        }
+                    }
+                    else
+                    {
+                        completePayload = payload;
+                    }
+
+                    if (completePayload != null && effectiveOpcode == 0x1)
+                    {
+                        string json = Encoding.UTF8.GetString(completePayload);
+                        HandleWsJsonMessage(conn, json);
+                    }
                 }
             }
+
+            if (fragBuffer != null)
+            {
+                try { fragBuffer.Dispose(); } catch { }
+            }
+        }
+
+        private void HandleWsJsonMessage(ClientConn conn, string json)
+        {
+            Dictionary<string, string> pkt = FlatJsonParser.ParseObject(json);
+            string kind;
+            if (!pkt.TryGetValue("kind", out kind)) return;
+
+            if (kind == "set-clipboard-text")
+            {
+                string text;
+                if (!pkt.TryGetValue("text", out text)) text = "";
+                _ignoreNextClipboardText = text;
+                _lastClipboardSignature = "T:" + text;
+                RunOnSta(delegate
+                {
+                    try { Clipboard.SetText(text); } catch { }
+                });
+                return;
+            }
+
+            if (kind == "request-clipboard-file")
+            {
+                string fileId;
+                if (!pkt.TryGetValue("id", out fileId) || string.IsNullOrEmpty(fileId)) return;
+                string fullPath = null;
+                lock (_clipLock)
+                {
+                    _clipboardFilePaths.TryGetValue(fileId, out fullPath);
+                }
+                if (string.IsNullOrEmpty(fullPath) || !File.Exists(fullPath))
+                {
+                    SendWsText(conn, "{\"kind\":\"agent-error\",\"message\":\"Arquivo da área de transferência não encontrado.\"}");
+                    return;
+                }
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    StreamClipboardFileToClient(conn, fileId, fullPath);
+                });
+                return;
+            }
+
+            if (kind == "save-file-start")
+            {
+                string fileId;
+                string fileName;
+                if (!pkt.TryGetValue("fileId", out fileId) || !pkt.TryGetValue("fileName", out fileName)) return;
+                string autoPasteStr;
+                bool autoPaste = pkt.TryGetValue("autoPaste", out autoPasteStr) && autoPasteStr == "true";
+
+                string downloadsRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                string destDir = Path.Combine(downloadsRoot, "OmniDesk");
+                Directory.CreateDirectory(destDir);
+
+                string safeName = SanitizeFileName(fileName);
+                string tempPath = Path.Combine(destDir, ".tmp-" + Guid.NewGuid().ToString("N") + ".part");
+                FileStream fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None);
+
+                PendingSaveFile psf = new PendingSaveFile();
+                psf.FileId = fileId;
+                psf.SafeName = safeName;
+                psf.TempPath = tempPath;
+                psf.DestDir = destDir;
+                psf.Writer = fs;
+                psf.AutoPaste = autoPaste;
+
+                lock (_clipLock)
+                {
+                    PendingSaveFile old;
+                    if (_pendingSaveFiles.TryGetValue(fileId, out old))
+                    {
+                        try { if (old.Writer != null) old.Writer.Dispose(); } catch { }
+                        try { if (File.Exists(old.TempPath)) File.Delete(old.TempPath); } catch { }
+                    }
+                    _pendingSaveFiles[fileId] = psf;
+                }
+                return;
+            }
+
+            if (kind == "save-file-chunk")
+            {
+                string fileId;
+                string dataB64;
+                if (!pkt.TryGetValue("fileId", out fileId) || !pkt.TryGetValue("dataB64", out dataB64)) return;
+                PendingSaveFile psf = null;
+                lock (_clipLock)
+                {
+                    _pendingSaveFiles.TryGetValue(fileId, out psf);
+                }
+                if (psf == null || psf.Writer == null) return;
+                if (!string.IsNullOrEmpty(dataB64))
+                {
+                    byte[] raw = Convert.FromBase64String(dataB64);
+                    psf.Writer.Write(raw, 0, raw.Length);
+                }
+                return;
+            }
+
+            if (kind == "save-file-end")
+            {
+                string fileId;
+                if (!pkt.TryGetValue("fileId", out fileId)) return;
+                PendingSaveFile psf = null;
+                lock (_clipLock)
+                {
+                    if (_pendingSaveFiles.TryGetValue(fileId, out psf))
+                    {
+                        _pendingSaveFiles.Remove(fileId);
+                    }
+                }
+                if (psf == null) return;
+
+                string finalPath = GetUniqueDestPath(psf.DestDir, psf.SafeName);
+                try
+                {
+                    psf.Writer.Flush();
+                    psf.Writer.Dispose();
+                    psf.Writer = null;
+                    File.Move(psf.TempPath, finalPath);
+
+                    RunOnStaSync(delegate
+                    {
+                        try
+                        {
+                            StringCollection sc = new StringCollection();
+                            sc.Add(finalPath);
+                            _ignoreClipboardUntilUtc = DateTime.UtcNow.AddSeconds(2);
+                            _lastClipboardSignature = "F:" + finalPath.ToLowerInvariant();
+                            Clipboard.SetFileDropList(sc);
+                        }
+                        catch { }
+                    });
+
+                    if (psf.AutoPaste)
+                    {
+                        Thread.Sleep(60);
+                        _executor.TriggerCtrlV();
+                    }
+
+                    SendWsText(
+                        conn,
+                        "{\"kind\":\"file-saved\",\"fileId\":\"" + EscapeJson(fileId) +
+                        "\",\"name\":\"" + EscapeJson(Path.GetFileName(finalPath)) +
+                        "\",\"path\":\"" + EscapeJson(finalPath) +
+                        "\",\"autoPaste\":" + (psf.AutoPaste ? "true" : "false") + "}"
+                    );
+                }
+                catch
+                {
+                    try { if (psf.Writer != null) psf.Writer.Dispose(); } catch { }
+                    try { if (File.Exists(psf.TempPath)) File.Delete(psf.TempPath); } catch { }
+                }
+                return;
+            }
+
+            _executor.Execute(pkt);
+        }
+
+        private void StreamClipboardFileToClient(ClientConn conn, string fileId, string fullPath)
+        {
+            try
+            {
+                FileInfo fi = new FileInfo(fullPath);
+                if (!fi.Exists || fi.Length > 157286400) // 150 MB safety cap
+                {
+                    SendWsText(conn, "{\"kind\":\"agent-error\",\"message\":\"Arquivo excede o limite de 150 MB para sincronização automática.\"}");
+                    return;
+                }
+
+                const int chunkBytes = 65536;
+                int totalChunks = (int)Math.Max(1, (fi.Length + chunkBytes - 1) / chunkBytes);
+                SendWsText(
+                    conn,
+                    "{\"kind\":\"agent-file-start\",\"id\":\"" + EscapeJson(fileId) +
+                    "\",\"name\":\"" + EscapeJson(fi.Name) +
+                    "\",\"size\":" + fi.Length +
+                    ",\"mimeType\":\"application/octet-stream\",\"totalChunks\":" + totalChunks + "}"
+                );
+
+                byte[] buf = new byte[chunkBytes];
+                int index = 0;
+                using (FileStream fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    if (fi.Length == 0)
+                    {
+                        SendWsText(
+                            conn,
+                            "{\"kind\":\"agent-file-chunk\",\"id\":\"" + EscapeJson(fileId) +
+                            "\",\"index\":0,\"dataB64\":\"\"}"
+                        );
+                    }
+                    else
+                    {
+                        int read;
+                        while ((read = fs.Read(buf, 0, buf.Length)) > 0 && _running)
+                        {
+                            string b64 = Convert.ToBase64String(buf, 0, read);
+                            SendWsText(
+                                conn,
+                                "{\"kind\":\"agent-file-chunk\",\"id\":\"" + EscapeJson(fileId) +
+                                "\",\"index\":" + index + ",\"dataB64\":\"" + b64 + "\"}"
+                            );
+                            index++;
+                        }
+                    }
+                }
+
+                SendWsText(conn, "{\"kind\":\"agent-file-end\",\"id\":\"" + EscapeJson(fileId) + "\"}");
+            }
+            catch
+            {
+                SendWsText(conn, "{\"kind\":\"agent-error\",\"message\":\"Erro ao ler arquivo copiado.\"}");
+            }
+        }
+
+        public void PollClipboard()
+        {
+            if (!_running || _activeClients <= 0) return;
+            if (DateTime.UtcNow < _ignoreClipboardUntilUtc) return;
+
+            try
+            {
+                if (Clipboard.ContainsFileDropList())
+                {
+                    StringCollection dropList = Clipboard.GetFileDropList();
+                    if (dropList == null || dropList.Count == 0) return;
+
+                    List<string> sigParts = new List<string>();
+                    StringBuilder itemsJson = new StringBuilder();
+                    Dictionary<string, string> nextMap = new Dictionary<string, string>(StringComparer.Ordinal);
+                    int count = 0;
+
+                    foreach (string p in dropList)
+                    {
+                        if (string.IsNullOrEmpty(p) || !File.Exists(p)) continue;
+                        FileInfo fi = new FileInfo(p);
+                        string id = "cf-" + Interlocked.Increment(ref _clipFileSeq);
+                        nextMap[id] = p;
+                        sigParts.Add(p.ToLowerInvariant() + ":" + fi.Length + ":" + fi.LastWriteTimeUtc.Ticks);
+                        if (count > 0) itemsJson.Append(',');
+                        itemsJson.Append("{\"id\":\"").Append(EscapeJson(id))
+                                 .Append("\",\"name\":\"").Append(EscapeJson(fi.Name))
+                                 .Append("\",\"size\":").Append(fi.Length)
+                                 .Append(",\"mimeType\":\"application/octet-stream\"}");
+                        count++;
+                        if (count >= 20) break;
+                    }
+
+                    if (count == 0) return;
+                    string sig = "F:" + string.Join("|", sigParts.ToArray());
+                    if (sig == _lastClipboardSignature) return;
+                    _lastClipboardSignature = sig;
+
+                    lock (_clipLock)
+                    {
+                        _clipboardFilePaths.Clear();
+                        foreach (KeyValuePair<string, string> kv in nextMap)
+                        {
+                            _clipboardFilePaths[kv.Key] = kv.Value;
+                        }
+                    }
+
+                    BroadcastJson("{\"kind\":\"clipboard-files\",\"files\":[" + itemsJson.ToString() + "]}");
+                }
+                else if (Clipboard.ContainsText())
+                {
+                    string text = Clipboard.GetText();
+                    if (string.IsNullOrEmpty(text)) return;
+                    string sig = "T:" + text;
+                    if (_ignoreNextClipboardText != null && text == _ignoreNextClipboardText)
+                    {
+                        _lastClipboardSignature = sig;
+                        _ignoreNextClipboardText = null;
+                        return;
+                    }
+                    if (sig == _lastClipboardSignature) return;
+                    _lastClipboardSignature = sig;
+                    BroadcastJson("{\"kind\":\"clipboard-text\",\"text\":\"" + EscapeJson(text) + "\"}");
+                }
+            }
+            catch
+            {
+                // Windows clipboard briefly locked by another process; retry on next poll
+            }
+        }
+
+        private void RunOnSta(Action work)
+        {
+            Action<Action> dispatcher = _staDispatcher;
+            if (dispatcher != null)
+            {
+                dispatcher(work);
+                return;
+            }
+            Thread t = new Thread(new ThreadStart(work));
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void RunOnStaSync(Action work)
+        {
+            if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            {
+                work();
+                return;
+            }
+            ManualResetEvent done = new ManualResetEvent(false);
+            RunOnSta(delegate
+            {
+                try { work(); }
+                finally { done.Set(); }
+            });
+            done.WaitOne(1500);
+            done.Close();
+        }
+
+        private void BroadcastJson(string json)
+        {
+            ClientConn[] snapshot;
+            lock (_clientsLock)
+            {
+                snapshot = _clients.ToArray();
+            }
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                SendWsText(snapshot[i], json);
+            }
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            string baseName = Path.GetFileName(string.IsNullOrEmpty(name) ? "arquivo.bin" : name);
+            if (string.IsNullOrEmpty(baseName)) baseName = "arquivo.bin";
+            char[] invalid = Path.GetInvalidFileNameChars();
+            StringBuilder sb = new StringBuilder(baseName.Length);
+            for (int i = 0; i < baseName.Length; i++)
+            {
+                char ch = baseName[i];
+                bool bad = (ch < 32);
+                if (!bad)
+                {
+                    for (int j = 0; j < invalid.Length; j++)
+                    {
+                        if (ch == invalid[j]) { bad = true; break; }
+                    }
+                }
+                sb.Append(bad ? '_' : ch);
+            }
+            string clean = sb.ToString().Trim();
+            return string.IsNullOrEmpty(clean) ? "arquivo.bin" : clean;
+        }
+
+        private static string GetUniqueDestPath(string dir, string safeName)
+        {
+            string candidate = Path.Combine(dir, safeName);
+            if (!File.Exists(candidate)) return candidate;
+            string stem = Path.GetFileNameWithoutExtension(safeName);
+            string ext = Path.GetExtension(safeName);
+            for (int i = 1; i <= 999; i++)
+            {
+                string next = Path.Combine(dir, stem + " (" + i + ")" + ext);
+                if (!File.Exists(next)) return next;
+            }
+            return Path.Combine(dir, stem + "-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ext);
+        }
+
+        private static string EscapeJson(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            StringBuilder sb = new StringBuilder(s.Length + 16);
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 32)
+                        {
+                            sb.Append("\\u").Append(((int)c).ToString("X4"));
+                        }
+                        else
+                        {
+                            sb.Append(c);
+                        }
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private static string ReadHttpHeaders(NetworkStream stream)
@@ -869,32 +1402,47 @@ namespace OmniDeskAgent
             }
         }
 
-        private static void SendWsText(NetworkStream stream, string text)
+        private static void SendWsText(ClientConn conn, string text)
         {
             byte[] data = Encoding.UTF8.GetBytes(text);
-            SendWsFrame(stream, 0x81, data);
+            SendWsFrame(conn, 0x81, data);
         }
 
-        private static void SendWsPong(NetworkStream stream, byte[] data)
+        private static void SendWsPong(ClientConn conn, byte[] data)
         {
-            SendWsFrame(stream, 0x8A, data);
+            SendWsFrame(conn, 0x8A, data);
         }
 
-        private static void SendWsFrame(NetworkStream stream, byte firstByte, byte[] data)
+        private static void SendWsFrame(ClientConn conn, byte firstByte, byte[] data)
         {
             try
             {
                 byte[] header;
-                if (data.Length < 126)
+                int len = data.Length;
+                if (len < 126)
                 {
-                    header = new byte[] { firstByte, (byte)data.Length };
+                    header = new byte[] { firstByte, (byte)len };
+                }
+                else if (len <= 65535)
+                {
+                    header = new byte[] { firstByte, 126, (byte)((len >> 8) & 0xFF), (byte)(len & 0xFF) };
                 }
                 else
                 {
-                    header = new byte[] { firstByte, 126, (byte)((data.Length >> 8) & 0xFF), (byte)(data.Length & 0xFF) };
+                    ulong ulen = (ulong)len;
+                    header = new byte[] {
+                        firstByte, 127,
+                        (byte)((ulen >> 56) & 0xFF), (byte)((ulen >> 48) & 0xFF),
+                        (byte)((ulen >> 40) & 0xFF), (byte)((ulen >> 32) & 0xFF),
+                        (byte)((ulen >> 24) & 0xFF), (byte)((ulen >> 16) & 0xFF),
+                        (byte)((ulen >> 8) & 0xFF), (byte)(ulen & 0xFF)
+                    };
                 }
-                stream.Write(header, 0, header.Length);
-                if (data.Length > 0) stream.Write(data, 0, data.Length);
+                lock (conn.WriteLock)
+                {
+                    conn.Stream.Write(header, 0, header.Length);
+                    if (len > 0) conn.Stream.Write(data, 0, len);
+                }
             }
             catch { }
         }
@@ -902,20 +1450,36 @@ namespace OmniDeskAgent
 
     internal sealed class AgentForm : Form
     {
+        private const string RunRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunValueName = "OmniDeskAgent";
+
         private readonly LoopbackBridgeServer _server;
         private readonly InputExecutor _executor;
         private readonly Label _statusLabel;
         private readonly Label _eventsLabel;
+        private readonly CheckBox _autoStartCheck;
+        private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _uiTimer;
+        private readonly bool _startInTray;
+        private bool _closing;
 
-        public AgentForm(LoopbackBridgeServer server, InputExecutor executor)
+        public AgentForm(LoopbackBridgeServer server, InputExecutor executor, bool startInTray)
         {
             _server = server;
             _executor = executor;
+            _startInTray = startInTray;
+
+            _server.AttachStaDispatcher(delegate(Action work)
+            {
+                if (!_closing && !IsDisposed && IsHandleCreated)
+                {
+                    try { BeginInvoke(work); } catch { }
+                }
+            });
 
             Text = "OmniDesk Agente Windows — Controle Nativo";
-            Width = 430;
-            Height = 200;
+            Width = 450;
+            Height = 235;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -926,30 +1490,45 @@ namespace OmniDeskAgent
             title.Text = "OmniDesk Agente Windows Ativo";
             title.Font = new Font("Segoe UI", 12, FontStyle.Bold);
             title.ForeColor = Color.FromArgb(34, 211, 238);
-            title.SetBounds(20, 18, 380, 26);
+            title.SetBounds(20, 18, 400, 26);
             Controls.Add(title);
 
             _statusLabel = new Label();
             _statusLabel.Text = "Aguardando navegador OmniDesk em 127.0.0.1:47831...";
             _statusLabel.Font = new Font("Segoe UI", 9, FontStyle.Regular);
             _statusLabel.ForeColor = Color.FromArgb(203, 213, 225);
-            _statusLabel.SetBounds(20, 52, 380, 22);
+            _statusLabel.SetBounds(20, 50, 400, 22);
             Controls.Add(_statusLabel);
 
             _eventsLabel = new Label();
             _eventsLabel.Text = "Comandos executados nesta sessão: 0";
             _eventsLabel.Font = new Font("Segoe UI", 9, FontStyle.Regular);
             _eventsLabel.ForeColor = Color.FromArgb(148, 163, 184);
-            _eventsLabel.SetBounds(20, 78, 380, 22);
+            _eventsLabel.SetBounds(20, 74, 400, 22);
             Controls.Add(_eventsLabel);
 
+            _autoStartCheck = new CheckBox();
+            _autoStartCheck.Text = "Iniciar automaticamente com o Windows (bandeja)";
+            _autoStartCheck.Font = new Font("Segoe UI", 9, FontStyle.Regular);
+            _autoStartCheck.ForeColor = Color.FromArgb(226, 232, 240);
+            _autoStartCheck.SetBounds(20, 106, 400, 24);
+            _autoStartCheck.Checked = IsAutoStartEnabled();
+            _autoStartCheck.CheckedChanged += delegate
+            {
+                if (!SetAutoStartEnabled(_autoStartCheck.Checked))
+                {
+                    _autoStartCheck.Checked = IsAutoStartEnabled();
+                }
+            };
+            Controls.Add(_autoStartCheck);
+
             Button minimizeBtn = new Button();
-            minimizeBtn.Text = "Minimizar";
+            minimizeBtn.Text = "Ocultar na Bandeja";
             minimizeBtn.BackColor = Color.FromArgb(30, 41, 59);
             minimizeBtn.ForeColor = Color.White;
             minimizeBtn.FlatStyle = FlatStyle.Flat;
-            minimizeBtn.SetBounds(20, 114, 120, 32);
-            minimizeBtn.Click += delegate { WindowState = FormWindowState.Minimized; };
+            minimizeBtn.SetBounds(20, 144, 155, 34);
+            minimizeBtn.Click += delegate { HideToTray(); };
             Controls.Add(minimizeBtn);
 
             Button stopBtn = new Button();
@@ -957,13 +1536,24 @@ namespace OmniDeskAgent
             stopBtn.BackColor = Color.FromArgb(225, 29, 72);
             stopBtn.ForeColor = Color.White;
             stopBtn.FlatStyle = FlatStyle.Flat;
-            stopBtn.SetBounds(250, 114, 150, 32);
+            stopBtn.SetBounds(265, 144, 155, 34);
             stopBtn.Click += delegate { Close(); };
             Controls.Add(stopBtn);
 
+            ContextMenu trayMenu = new ContextMenu();
+            trayMenu.MenuItems.Add("Abrir Janela OmniDesk", delegate { ShowFromTray(); });
+            trayMenu.MenuItems.Add("Encerrar Agente", delegate { Close(); });
+
+            _trayIcon = new NotifyIcon();
+            _trayIcon.Icon = SystemIcons.Application;
+            _trayIcon.Text = "OmniDesk Agente Windows (Porta 47831)";
+            _trayIcon.ContextMenu = trayMenu;
+            _trayIcon.Visible = true;
+            _trayIcon.DoubleClick += delegate { ShowFromTray(); };
+
             _server.StatusChanged += delegate(string text)
             {
-                if (!IsDisposed && IsHandleCreated)
+                if (!_closing && !IsDisposed && IsHandleCreated)
                 {
                     BeginInvoke((MethodInvoker)delegate { _statusLabel.Text = text; });
                 }
@@ -974,14 +1564,113 @@ namespace OmniDeskAgent
             _uiTimer.Tick += delegate
             {
                 _eventsLabel.Text = "Comandos de mouse/teclado executados: " + _executor.EventsExecuted;
+                _server.PollClipboard();
             };
             _uiTimer.Start();
 
+            Resize += delegate
+            {
+                if (WindowState == FormWindowState.Minimized)
+                {
+                    ShowInTaskbar = false;
+                    Hide();
+                }
+            };
+
+            Load += delegate
+            {
+                if (_startInTray)
+                {
+                    BeginInvoke((MethodInvoker)delegate { HideToTray(); });
+                }
+            };
+
             FormClosing += delegate
             {
+                _closing = true;
                 _uiTimer.Stop();
+                _trayIcon.Visible = false;
+                _trayIcon.Dispose();
                 _server.Stop();
             };
+        }
+
+        private void HideToTray()
+        {
+            ShowInTaskbar = false;
+            WindowState = FormWindowState.Minimized;
+            Hide();
+        }
+
+        private void ShowFromTray()
+        {
+            ShowInTaskbar = true;
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try { NativeWin32.AddClipboardFormatListener(Handle); } catch { }
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            try { NativeWin32.RemoveClipboardFormatListener(Handle); } catch { }
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == NativeWin32.WM_CLIPBOARDUPDATE && _server != null)
+            {
+                _server.PollClipboard();
+            }
+            base.WndProc(ref m);
+        }
+
+        private static bool IsAutoStartEnabled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, false))
+                {
+                    if (key == null) return false;
+                    object val = key.GetValue(RunValueName);
+                    return val != null && !string.IsNullOrEmpty(val.ToString());
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool SetAutoStartEnabled(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, true) ??
+                                         Registry.CurrentUser.CreateSubKey(RunRegistryPath))
+                {
+                    if (key == null) return false;
+                    if (enable)
+                    {
+                        key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\" --tray");
+                    }
+                    else
+                    {
+                        key.DeleteValue(RunValueName, false);
+                    }
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 
@@ -990,8 +1679,20 @@ namespace OmniDeskAgent
         private static Mutex _singleInstanceMutex;
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            bool startInTray = false;
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (string.Equals(args[i], "--tray", StringComparison.OrdinalIgnoreCase))
+                    {
+                        startInTray = true;
+                    }
+                }
+            }
+
             bool createdNew;
             _singleInstanceMutex = new Mutex(true, "OmniDesk_Windows_Native_Agent_47831", out createdNew);
             if (!createdNew)
@@ -1025,7 +1726,7 @@ namespace OmniDeskAgent
                 return;
             }
 
-            Application.Run(new AgentForm(server, executor));
+            Application.Run(new AgentForm(server, executor, startInTray));
             GC.KeepAlive(_singleInstanceMutex);
         }
     }

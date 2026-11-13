@@ -9,6 +9,8 @@ export interface ViewportDimensions {
 
 export interface InputControllerCallbacks {
   onInputPacket: (packet: InputPacket) => void;
+  interceptClipboardShortcuts?: boolean;
+  onRemoteCopyTriggered?: () => void;
 }
 
 export interface NormalizedCoordinates {
@@ -82,7 +84,60 @@ export class InputController {
   private callbacks: InputControllerCallbacks;
   private isAttached = false;
   private lastMoveTime = 0;
-  private readonly THROTTLE_MS = 16; // ~60fps input updates
+  private readonly THROTTLE_MS = 8; // ~125Hz smooth mouse tracking without queue lag
+  private pasteInterceptState: "idle" | "waiting" | "suppressed" = "idle";
+  private pendingPasteTimer: number | null = null;
+  private pendingPasteDispatch: (() => void) | null = null;
+  private pendingPasteRelease: (() => void) | null = null;
+  private pendingModifierUps: Array<() => void> = [];
+  private releasedKeyVDuringWait = false;
+
+  public markLocalPasteHandled(suppressRemoteKeyV: boolean, releaseDelayMs = 0): void {
+    if (this.pendingPasteTimer !== null) {
+      window.clearTimeout(this.pendingPasteTimer);
+      this.pendingPasteTimer = null;
+    }
+    if (this.pasteInterceptState !== "waiting") return;
+    if (suppressRemoteKeyV) {
+      this.pasteInterceptState = "suppressed";
+      this.pendingPasteDispatch = null;
+      this.pendingPasteRelease = null;
+      this.releasedKeyVDuringWait = false;
+      this.flushDeferredModifierUps();
+      return;
+    }
+    if (releaseDelayMs > 0) {
+      this.pendingPasteTimer = window.setTimeout(() => {
+        this.pendingPasteTimer = null;
+        this.dispatchPendingPasteKeys();
+      }, releaseDelayMs);
+    } else {
+      this.dispatchPendingPasteKeys();
+    }
+  }
+
+  private flushDeferredModifierUps(): void {
+    const queue = this.pendingModifierUps.splice(0, this.pendingModifierUps.length);
+    for (const fn of queue) {
+      fn();
+    }
+  }
+
+  private dispatchPendingPasteKeys(): void {
+    if (this.pasteInterceptState !== "waiting") return;
+    const downFn = this.pendingPasteDispatch;
+    const upFn = this.pendingPasteRelease;
+    const shouldRelease = this.releasedKeyVDuringWait;
+    this.pasteInterceptState = "idle";
+    this.pendingPasteDispatch = null;
+    this.pendingPasteRelease = null;
+    this.releasedKeyVDuringWait = false;
+    downFn?.();
+    if (shouldRelease) {
+      upFn?.();
+    }
+    this.flushDeferredModifierUps();
+  }
 
   constructor(callbacks: InputControllerCallbacks) {
     this.callbacks = callbacks;
@@ -210,30 +265,106 @@ export class InputController {
   };
 
   private handleKeyDown = (e: KeyboardEvent): void => {
+    const emitKeyDown = (): void => {
+      this.callbacks.onInputPacket({
+        kind: "key-down",
+        key: e.key,
+        code: e.code,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+      });
+    };
+
+    if (
+      this.callbacks.interceptClipboardShortcuts &&
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey &&
+      e.code === "KeyV" &&
+      !e.repeat
+    ) {
+      // Allow browser's native paste event to fire synchronously before remote Ctrl+V
+      if (this.pendingPasteTimer !== null) {
+        window.clearTimeout(this.pendingPasteTimer);
+      }
+      this.pasteInterceptState = "waiting";
+      this.releasedKeyVDuringWait = false;
+      this.pendingModifierUps = [];
+      this.pendingPasteDispatch = emitKeyDown;
+      this.pendingPasteRelease = () => {
+        this.callbacks.onInputPacket({
+          kind: "key-up",
+          key: e.key,
+          code: e.code,
+          altKey: e.altKey,
+          ctrlKey: e.ctrlKey,
+          shiftKey: e.shiftKey,
+          metaKey: e.metaKey,
+        });
+      };
+      this.pendingPasteTimer = window.setTimeout(() => {
+        this.pendingPasteTimer = null;
+        this.dispatchPendingPasteKeys();
+      }, 60);
+      return;
+    }
+
     // Intercept standard hotkeys like Ctrl+W, Tab, F5 when controlling remote
     e.preventDefault();
-    this.callbacks.onInputPacket({
-      kind: "key-down",
-      key: e.key,
-      code: e.code,
-      altKey: e.altKey,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      metaKey: e.metaKey,
-    });
+    emitKeyDown();
+
+    if (
+      this.callbacks.interceptClipboardShortcuts &&
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey &&
+      e.code === "KeyC" &&
+      !e.repeat
+    ) {
+      this.callbacks.onRemoteCopyTriggered?.();
+    }
   };
 
   private handleKeyUp = (e: KeyboardEvent): void => {
+    const emitKeyUp = (): void => {
+      this.callbacks.onInputPacket({
+        kind: "key-up",
+        key: e.key,
+        code: e.code,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+      });
+    };
+
+    if (this.pasteInterceptState === "suppressed" && e.code === "KeyV") {
+      e.preventDefault();
+      this.pasteInterceptState = "idle";
+      return;
+    }
+
+    if (this.pasteInterceptState === "waiting") {
+      if (e.code === "KeyV") {
+        e.preventDefault();
+        this.releasedKeyVDuringWait = true;
+        this.pendingPasteRelease = emitKeyUp;
+        return;
+      }
+      if (
+        e.code === "ControlLeft" ||
+        e.code === "ControlRight" ||
+        e.code === "MetaLeft" ||
+        e.code === "MetaRight"
+      ) {
+        e.preventDefault();
+        this.pendingModifierUps.push(emitKeyUp);
+        return;
+      }
+    }
+
     e.preventDefault();
-    this.callbacks.onInputPacket({
-      kind: "key-up",
-      key: e.key,
-      code: e.code,
-      altKey: e.altKey,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      metaKey: e.metaKey,
-    });
+    emitKeyUp();
   };
 
   private resolveButton(button: number): "left" | "right" | "middle" {

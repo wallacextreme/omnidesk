@@ -249,5 +249,23 @@ describe("Phase 4: Hybrid Cloud Signaling & Windows 7 Zero-Config", () => {
       expect(typeof relay.stop).toBe("function");
       relay.stop();
     });
+
+    it("should validate transfer-relay and stream-quality schemas cleanly", () => {
+      const { parseSignalingMessage, parseControlPacket } = require("../../src/shared/protocol");
+      const relayMsg = parseSignalingMessage({
+        type: "transfer-relay",
+        targetId: "123456789",
+        senderId: "987654321",
+        packet: {
+          kind: "clipboard-sync",
+          text: "Olá OmniDesk",
+          timestamp: Date.now(),
+        },
+      });
+      expect(relayMsg?.type).toBe("transfer-relay");
+
+      const qualityPkt = parseControlPacket({ kind: "stream-quality", quality: "original" });
+      expect(qualityPkt?.kind).toBe("stream-quality");
+    });
   });
 });

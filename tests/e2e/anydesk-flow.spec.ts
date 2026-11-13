@@ -66,6 +66,10 @@ async function startMockWindowsAgent() {
           if (buf.length < 4) return;
           payloadLen = buf.readUInt16BE(2);
           offset = 4;
+        } else if (payloadLen === 127) {
+          if (buf.length < 10) return;
+          payloadLen = Number(buf.readBigUInt64BE(2));
+          offset = 10;
         }
         const maskLen = masked ? 4 : 0;
         if (buf.length < offset + maskLen + payloadLen) return;
@@ -260,7 +264,9 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
     await pageClient.goto("http://localhost:5173");
 
     const hostIdDisplay = pageHost.locator('[data-testid="device-id-display"]');
+    const clientIdDisplay = pageClient.locator('[data-testid="device-id-display"]');
     await expect(hostIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
+    await expect(clientIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
     const hostId = (await hostIdDisplay.innerText()).trim();
 
     // Host configures unattended access password
@@ -474,6 +480,141 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
           timeout: 5000,
         })
         .toBe(true);
+    } finally {
+      await contextHost.close();
+      await contextClient.close();
+      await mockAgent.close();
+    }
+  });
+
+  test("Single remote cursor (no ghosting), viewport Drag & Drop, and Ctrl+V clipboard/file paste", async ({
+    browser,
+  }) => {
+    const mockAgent = await startMockWindowsAgent();
+    const contextHost = await browser.newContext();
+    const contextClient = await browser.newContext();
+
+    const pageHost = await contextHost.newPage();
+    const pageClient = await contextClient.newPage();
+
+    await pageHost.addInitScript((agentUrl: string) => {
+      localStorage.setItem("omnidesk_agent_url", agentUrl);
+    }, mockAgent.wsUrl);
+
+    try {
+      await pageHost.goto("http://localhost:5173");
+      await pageClient.goto("http://localhost:5173");
+
+      const hostIdDisplay = pageHost.locator('[data-testid="device-id-display"]');
+      const clientIdDisplay = pageClient.locator('[data-testid="device-id-display"]');
+      await expect(hostIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
+      await expect(clientIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
+      const hostIdText = (await hostIdDisplay.innerText()).trim();
+
+      await pageClient.locator('[data-testid="remote-id-input"]').fill(hostIdText);
+      await pageClient.locator('[data-testid="connect-button"]').click();
+
+      await expect(pageHost.locator('[data-testid="incoming-request-modal"]')).toBeVisible({
+        timeout: 10000,
+      });
+      await pageHost.locator('[data-testid="accept-request-btn"]').click();
+
+      await expect(pageClient.locator('[data-testid="remote-viewport"]')).toBeVisible({
+        timeout: 10000,
+      });
+      await expect(pageClient.locator('[data-testid="waiting-video-overlay"]')).toBeHidden({
+        timeout: 15000,
+      });
+
+      // Wait for real WebRTC video dimensions so single-cursor logic can hide local cursor on video
+      await pageClient.waitForFunction(() => {
+        const v = document.querySelector('[data-testid="remote-video-element"]') as HTMLVideoElement | null;
+        return Boolean(v && v.videoWidth > 0);
+      }, null, { timeout: 15000 });
+
+      // Move pointer over center of active video -> single cursor (cursor-none) must activate!
+      const captureOverlay = pageClient.locator('[data-testid="remote-input-capture"]');
+      const box = await captureOverlay.boundingBox();
+      if (!box) throw new Error("Missing capture overlay boundingBox");
+      await pageClient.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+
+      await expect(captureOverlay).toHaveClass(/cursor-none/, { timeout: 5000 });
+
+      // Toggling Cursor Duplo restores cursor-default cleanly
+      await pageClient.locator('[data-testid="toggle-cursor-btn"]').click();
+      await expect(captureOverlay).toHaveClass(/cursor-default/);
+
+      // 1. Ctrl+V text paste event syncs text to Host Windows Agent
+      await pageClient.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.setData("text/plain", "OmniDesk-Clipboard-Sync-2026");
+        const ev = new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+        window.dispatchEvent(ev);
+      });
+
+      await expect
+        .poll(
+          () =>
+            mockAgent.receivedPackets.some(
+              (p) => p.kind === "set-clipboard-text" && p.text === "OmniDesk-Clipboard-Sync-2026"
+            ),
+          { timeout: 10000 }
+        )
+        .toBe(true);
+
+      // 2. Ctrl+V pasted file transfers automatically with autoPaste: true
+      await pageClient.evaluate(() => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(["Conteudo via Ctrl+V"], "colado-e2e.txt", { type: "text/plain" }));
+        const ev = new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+        window.dispatchEvent(ev);
+      });
+
+      await expect
+        .poll(
+          () =>
+            mockAgent.receivedPackets.some(
+              (p) => p.kind === "save-file-start" && p.fileName === "colado-e2e.txt" && p.autoPaste === true
+            ) && mockAgent.receivedPackets.some((p) => p.kind === "save-file-end"),
+          { timeout: 10000 }
+        )
+        .toBe(true);
+
+      // 3. Full-viewport Drag & Drop transfers file directly without opening FileTransferDrawer
+      await pageClient.evaluate(() => {
+        const el = document.querySelector('[data-testid="remote-viewport"]');
+        if (!el) throw new Error("remote-viewport not found");
+        const dt = new DataTransfer();
+        dt.items.add(new File(["Conteudo via Drop"], "solto-viewport.txt", { type: "text/plain" }));
+        el.dispatchEvent(
+          new DragEvent("drop", {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: dt,
+          })
+        );
+      });
+
+      await expect
+        .poll(
+          () =>
+            mockAgent.receivedPackets.some(
+              (p) => p.kind === "save-file-start" && p.fileName === "solto-viewport.txt" && p.autoPaste === false
+            ),
+          { timeout: 10000 }
+        )
+        .toBe(true);
+
+      await pageClient.locator('[data-testid="end-session-btn"]').click();
+      await expect(hostIdDisplay).toBeVisible({ timeout: 10000 });
     } finally {
       await contextHost.close();
       await contextClient.close();

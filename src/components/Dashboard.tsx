@@ -251,7 +251,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
       {/* Signaling Configuration Modal */}
       {showConfigModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-6 shadow-2xl relative">
             <button
               onClick={() => setShowConfigModal(false)}
@@ -355,7 +355,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Left Column: Este Dispositivo */}
         <div className="lg:col-span-5 space-y-6">
-          <div className="bg-slate-900/70 border border-slate-800/90 rounded-2xl p-6 backdrop-blur-xl shadow-xl shadow-black/40">
+          <div className="bg-slate-900 border border-slate-800/90 rounded-2xl p-6 shadow-xl shadow-black/40">
             <div className="flex items-center justify-between mb-4">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Este Dispositivo</span>
               <span className="flex items-center gap-1.5 text-xs text-emerald-400">
@@ -522,7 +522,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         {/* Right Column: Conectar a Outro Dispositivo */}
         <div className="lg:col-span-7 space-y-6">
           {/* Connection Input Card */}
-          <div className="bg-slate-900/70 border border-slate-800/90 rounded-2xl p-6 backdrop-blur-xl shadow-xl shadow-black/40">
+          <div className="bg-slate-900 border border-slate-800/90 rounded-2xl p-6 shadow-xl shadow-black/40">
             <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 block mb-4">
               Conectar a Outro Dispositivo
             </span>
@@ -566,7 +566,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
 
           {/* Recent & Favorite Sessions */}
-          <div className="bg-slate-900/70 border border-slate-800/90 rounded-2xl p-6 backdrop-blur-xl shadow-xl shadow-black/40">
+          <div className="bg-slate-900 border border-slate-800/90 rounded-2xl p-6 shadow-xl shadow-black/40">
             <div className="flex items-center justify-between mb-4">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
                 <Clock className="w-3.5 h-3.5 text-slate-400" />

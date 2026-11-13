@@ -10,6 +10,7 @@ import {
 } from "../../src/core/input-controller";
 import { sha256 } from "../../src/core/crypto";
 import { NativeBridge } from "../../src/core/native-bridge";
+import { ACLGuard } from "../../src/core/acl-guard";
 import type { TransferChannelPacket } from "../../src/shared/protocol";
 
 describe("Phase 3: Input & File Transfer Quality Gate", () => {
@@ -260,6 +261,34 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
         expect(receivedPackets.some((p) => p.kind === "mouse-down" && p.button === "left" && p.x === 0.5 && p.y === 0.25)).toBe(true);
         expect(receivedPackets.some((p) => p.kind === "key-down" && p.code === "KeyA" && p.key === "a")).toBe(true);
         expect(receivedPackets.some((p) => p.kind === "release-all")).toBe(true);
+
+        // Save received file into Windows Agent (with autoPaste) & receive clipboard events
+        const events: string[] = [];
+        const unsub = bridge.subscribeAgentEvents((ev) => {
+          events.push(ev.kind);
+        });
+        const sampleBytes = new TextEncoder().encode("OmniDesk Unit File");
+        const savedOk = await bridge.saveReceivedFileToAgent(
+          "unit-doc.txt",
+          sampleBytes.buffer.slice(
+            sampleBytes.byteOffset,
+            sampleBytes.byteOffset + sampleBytes.byteLength
+          ),
+          true
+        );
+        expect(savedOk).toBe(true);
+        await new Promise((r) => setTimeout(r, 40));
+        expect(
+          receivedPackets.some(
+            (p) =>
+              p.kind === "save-file-start" &&
+              p.fileName === "unit-doc.txt" &&
+              p.autoPaste === true
+          )
+        ).toBe(true);
+        expect(receivedPackets.some((p) => p.kind === "save-file-chunk")).toBe(true);
+        expect(receivedPackets.some((p) => p.kind === "save-file-end")).toBe(true);
+        unsub();
       } finally {
         bridge.stopAgentDiscovery();
         server.stop(true);
@@ -274,6 +303,58 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
           (globalThis as Record<string, unknown>).window = originalWindow;
         }
       }
+    });
+  });
+
+  describe("5. AutoPaste Metadata & ACL Guards", () => {
+    it("should preserve autoPaste flag across FileSender/FileReceiver and enforce ACL for new packets", async () => {
+      const packets: TransferChannelPacket[] = [];
+      let receivedAutoPaste: boolean | undefined;
+      const sender = new FileSender({
+        sendPacket: (pkt) => {
+          packets.push(pkt);
+          return true;
+        },
+        getBufferedAmount: () => 0,
+        onProgress: () => {},
+      });
+      const receiver = new FileReceiver({
+        sendPacket: () => true,
+        onProgress: () => {},
+        onFileReceived: (f) => {
+          receivedAutoPaste = f.autoPaste;
+        },
+      });
+
+      const file = new File([new Uint8Array([1, 2, 3, 4])], "pasted.txt", { type: "text/plain" });
+      await sender.sendFile(file, { autoPaste: true });
+      for (const pkt of packets) {
+        await receiver.handlePacket(pkt);
+      }
+      expect(receivedAutoPaste).toBe(true);
+
+      const guard = new ACLGuard({
+        allowInput: false,
+        allowClipboard: false,
+        allowFileTransfer: false,
+        allowAudio: false,
+      });
+      expect(guard.canExecuteControlPacket({ kind: "stream-quality", quality: "original" })).toBe(true);
+      expect(guard.canExecuteTransferPacket({ kind: "clipboard-sync", text: "abc", timestamp: 1 })).toBe(false);
+      expect(
+        guard.canExecuteTransferPacket({
+          kind: "clipboard-files-ready",
+          files: [{ id: "1", name: "a.txt", size: 10 }],
+        })
+      ).toBe(false);
+      expect(
+        guard.canExecuteTransferPacket({ kind: "clipboard-file-request", id: "1" })
+      ).toBe(false);
+
+      guard.updatePermissions({ allowFileTransfer: true, allowClipboard: true });
+      expect(
+        guard.canExecuteTransferPacket({ kind: "clipboard-file-request", id: "1" })
+      ).toBe(true);
     });
   });
 });

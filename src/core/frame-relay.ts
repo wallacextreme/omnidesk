@@ -11,9 +11,9 @@ export class FrameRelayHost {
   private timer: ReturnType<typeof setInterval> | null = null;
   private isRunning = false;
   private isPaused = false;
-  private maxWidth = 960;
+  private maxWidth = 1280;
   private intervalMs = 200;
-  private adaptiveQuality = 0.58;
+  private adaptiveQuality = 0.72;
   private webpSupported: boolean | null = null;
   private lastFrameDataUrl = "";
   private lastSentAt = 0;
@@ -23,7 +23,7 @@ export class FrameRelayHost {
     private onFrame: (frameDataUrl: string, width: number, height: number) => void
   ) {}
 
-  public start(intervalMs = 200, maxWidth = 960): void {
+  public start(intervalMs = 200, maxWidth = 1280): void {
     if (this.isRunning) return;
     this.isRunning = true;
     this.isPaused = false;
@@ -124,11 +124,11 @@ export class FrameRelayHost {
     this.ctx.drawImage(this.video, 0, 0, targetW, targetH);
 
     let dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
-    if (dataUrl.length > 85_000 && this.adaptiveQuality > 0.36) {
-      this.adaptiveQuality = Math.max(0.36, this.adaptiveQuality - 0.1);
+    if (dataUrl.length > 90_000 && this.adaptiveQuality > 0.42) {
+      this.adaptiveQuality = Math.max(0.42, this.adaptiveQuality - 0.1);
       dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
-    } else if (dataUrl.length < 40_000 && this.adaptiveQuality < 0.62) {
-      this.adaptiveQuality = Math.min(0.62, this.adaptiveQuality + 0.04);
+    } else if (dataUrl.length < 48_000 && this.adaptiveQuality < 0.78) {
+      this.adaptiveQuality = Math.min(0.78, this.adaptiveQuality + 0.04);
     }
 
     const now = Date.now();

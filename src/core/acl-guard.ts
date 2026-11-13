@@ -143,6 +143,7 @@ export class ACLGuard {
         return true;
       case "chat-message":
       case "telemetry":
+      case "stream-quality":
         return true;
       default: {
         const _exhaustive: never = packet;
@@ -172,6 +173,9 @@ export class ACLGuard {
     switch (packet.kind) {
       case "clipboard-sync":
         return this.permissions.allowClipboard;
+      case "clipboard-files-ready":
+      case "clipboard-file-request":
+        return this.permissions.allowClipboard && this.permissions.allowFileTransfer;
       case "file-metadata":
       case "file-chunk":
       case "file-ack":

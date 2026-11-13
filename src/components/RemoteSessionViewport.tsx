@@ -1,6 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Info, X } from "lucide-react";
-import { InputController } from "../core/input-controller";
+import { AlertTriangle, Info, UploadCloud, X } from "lucide-react";
+import {
+  InputController,
+  calculateNormalizedCoordinates,
+} from "../core/input-controller";
 import { SessionHUD } from "./SessionHUD";
 import { ChatDrawer } from "./ChatDrawer";
 import { FileTransferDrawer } from "./FileTransferDrawer";
@@ -26,6 +29,17 @@ interface RemoteSessionViewportProps {
   localSenderName: string;
   activeTransferProgress: FileTransferProgress | null;
   onSendFile: (file: File) => void;
+  onSendFiles?: (files: File[], options?: { autoPaste?: boolean }) => void;
+  onSyncClipboardText?: (text: string) => void;
+  onChangeQuality?: (q: "performance" | "balanced" | "original") => void;
+  lastSyncedClipboardText?: string;
+  statusBanner?: {
+    id: string;
+    text: string;
+    actionLabel?: string;
+    onAction?: () => void;
+  } | null;
+  onDismissStatusBanner?: () => void;
   receivedFiles: Array<{ name: string; size: number; blob: Blob; sha256: string }>;
   isHost: boolean;
 }
@@ -48,6 +62,12 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   localSenderName,
   activeTransferProgress,
   onSendFile,
+  onSendFiles,
+  onSyncClipboardText,
+  onChangeQuality: onChangeQualityProp,
+  lastSyncedClipboardText,
+  statusBanner,
+  onDismissStatusBanner,
   receivedFiles,
   isHost,
 }) => {
@@ -63,10 +83,32 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   onEndSessionRef.current = onEndSession;
   const allowInputRef = useRef(permissions.allowInput);
   allowInputRef.current = permissions.allowInput;
+  const allowClipboardRef = useRef(permissions.allowClipboard);
+  allowClipboardRef.current = permissions.allowClipboard;
+  const allowFileTransferRef = useRef(permissions.allowFileTransfer);
+  allowFileTransferRef.current = permissions.allowFileTransfer;
+  const onSendFileRef = useRef(onSendFile);
+  onSendFileRef.current = onSendFile;
+  const onSendFilesRef = useRef(onSendFiles);
+  onSendFilesRef.current = onSendFiles;
+  const onSyncClipboardTextRef = useRef(onSyncClipboardText);
+  onSyncClipboardTextRef.current = onSyncClipboardText;
+  const lastSyncedClipboardTextRef = useRef(lastSyncedClipboardText ?? "");
+  const fallbackFrameSizeRef = useRef(fallbackFrameSize);
+  fallbackFrameSizeRef.current = fallbackFrameSize;
+
+  useEffect(() => {
+    if (lastSyncedClipboardText !== undefined) {
+      lastSyncedClipboardTextRef.current = lastSyncedClipboardText;
+    }
+  }, [lastSyncedClipboardText]);
 
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [quality, setQuality] = useState<"performance" | "balanced" | "original">("balanced");
+  const [hideLocalCursor, setHideLocalCursor] = useState(true);
+  const [isPointerOverVideo, setIsPointerOverVideo] = useState(false);
+  const [isViewportDragOver, setIsViewportDragOver] = useState(false);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [showMirrorTip, setShowMirrorTip] = useState(true);
   const [showViewOnlyNotice, setShowViewOnlyNotice] = useState(true);
@@ -170,6 +212,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     if (isHost) return;
 
     const controller = new InputController({
+      interceptClipboardShortcuts: true,
       onInputPacket: (packet) => {
         if (allowInputRef.current) {
           onSendInputPacketRef.current(packet);
@@ -192,6 +235,78 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     };
   }, [isHost]);
 
+  // AnyDesk-style Ctrl+C -> Ctrl+V (files & text) via browser paste event
+  useEffect(() => {
+    if (isHost) return;
+
+    const handlePaste = (e: ClipboardEvent) => {
+      const activeEl = document.activeElement as HTMLElement | null;
+      const tag = activeEl?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || activeEl?.isContentEditable) {
+        return;
+      }
+
+      if (!allowFileTransferRef.current && !allowClipboardRef.current) {
+        inputControllerRef.current?.markLocalPasteHandled(false, 0);
+        return;
+      }
+
+      const dt = e.clipboardData;
+      if (!dt) {
+        inputControllerRef.current?.markLocalPasteHandled(false, 0);
+        return;
+      }
+
+      const fileList: File[] = [];
+      if (dt.files && dt.files.length > 0) {
+        for (let i = 0; i < dt.files.length; i++) {
+          const f = dt.files[i];
+          if (f) fileList.push(f);
+        }
+      } else if (dt.items && dt.items.length > 0) {
+        for (let i = 0; i < dt.items.length; i++) {
+          const item = dt.items[i];
+          if (item && item.kind === "file") {
+            const f = item.getAsFile();
+            if (f) fileList.push(f);
+          }
+        }
+      }
+
+      if (fileList.length > 0 && allowFileTransferRef.current) {
+        e.preventDefault();
+        inputControllerRef.current?.markLocalPasteHandled(true);
+        if (onSendFilesRef.current) {
+          onSendFilesRef.current(fileList, { autoPaste: true });
+        } else {
+          for (const f of fileList) {
+            onSendFileRef.current(f);
+          }
+        }
+        return;
+      }
+
+      const pastedText = dt.getData("text/plain") ?? "";
+      if (pastedText.length > 0 && allowClipboardRef.current) {
+        if (pastedText === lastSyncedClipboardTextRef.current) {
+          inputControllerRef.current?.markLocalPasteHandled(false, 0);
+        } else {
+          lastSyncedClipboardTextRef.current = pastedText;
+          onSyncClipboardTextRef.current?.(pastedText);
+          inputControllerRef.current?.markLocalPasteHandled(false, 45);
+        }
+        return;
+      }
+
+      inputControllerRef.current?.markLocalPasteHandled(false, 0);
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => {
+      window.removeEventListener("paste", handlePaste);
+    };
+  }, [isHost]);
+
   // Handle unread messages
   useEffect(() => {
     if (!isChatOpen && chatMessages.length > 0) {
@@ -204,11 +319,60 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     setUnreadChatCount(0);
   };
 
+  const dispatchFilesToHost = (fileList: FileList | null, autoPaste = false) => {
+    if (!fileList || fileList.length === 0) return;
+    const arr = Array.from(fileList);
+    if (onSendFilesRef.current) {
+      onSendFilesRef.current(arr, { autoPaste });
+    } else {
+      for (const f of arr) {
+        onSendFileRef.current(f);
+      }
+    }
+  };
+
+  const handleQualityChange = (q: "performance" | "balanced" | "original") => {
+    setQuality(q);
+    onChangeQualityProp?.(q);
+  };
+
+  const isFallbackRelay = !isWebRtcPlaying && Boolean(fallbackFrame);
+
+  const showRemoteCursorOnly =
+    permissions.allowInput &&
+    hideLocalCursor &&
+    isWebRtcPlaying &&
+    !isFallbackRelay &&
+    isPointerOverVideo;
+
   return (
     <div
       id="remote-viewport-container"
       data-testid="remote-viewport"
       ref={containerRef}
+      onDragOver={(e) => {
+        if (isHost || !permissions.allowFileTransfer) return;
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          if (!isViewportDragOver) setIsViewportDragOver(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setIsViewportDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        if (isHost || !permissions.allowFileTransfer) return;
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          e.preventDefault();
+          setIsViewportDragOver(false);
+          dispatchFilesToHost(e.dataTransfer.files, false);
+        } else {
+          setIsViewportDragOver(false);
+        }
+      }}
       className="relative w-screen h-screen bg-black overflow-hidden flex items-center justify-center select-none cursor-default outline-none"
     >
       {/* Fixed Emergency Escape Button - Hidden when right drawer is open so drawer close button stays unobstructed */}
@@ -239,9 +403,58 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         isFilesOpen={isFilesOpen}
         unreadChatCount={unreadChatCount}
         quality={quality}
-        onChangeQuality={setQuality}
+        onChangeQuality={handleQualityChange}
+        hideLocalCursor={hideLocalCursor}
+        onToggleHideLocalCursor={() => setHideLocalCursor((v) => !v)}
         isHost={isHost}
       />
+
+      {/* Viewport Drag & Drop File Overlay */}
+      {isViewportDragOver && !isHost && (
+        <div
+          data-testid="viewport-drop-overlay"
+          className="fixed inset-0 z-30 pointer-events-none flex items-center justify-center bg-slate-950/85 border-4 border-dashed border-cyan-400"
+        >
+          <div className="bg-slate-900 border border-cyan-500/40 rounded-2xl px-8 py-6 flex flex-col items-center gap-3 shadow-2xl">
+            <UploadCloud className="w-12 h-12 text-cyan-400" />
+            <p className="text-base font-bold text-white">
+              Solte aqui para enviar ao Host
+            </p>
+            <p className="text-xs text-slate-400">
+              Os arquivos serão entregues na pasta Downloads\OmniDesk e na Área de Transferência do Host
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Non-intrusive Status / Clipboard / File Toast */}
+      {statusBanner && (
+        <div
+          data-testid="session-status-banner"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 px-4 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/40 shadow-2xl text-xs text-slate-100 max-w-md"
+        >
+          <span className="truncate">{statusBanner.text}</span>
+          {statusBanner.actionLabel && statusBanner.onAction && (
+            <button
+              type="button"
+              onClick={statusBanner.onAction}
+              className="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-200 font-semibold whitespace-nowrap transition"
+            >
+              {statusBanner.actionLabel}
+            </button>
+          )}
+          {onDismissStatusBanner && (
+            <button
+              type="button"
+              onClick={onDismissStatusBanner}
+              className="p-0.5 text-slate-400 hover:text-white transition"
+              title="Fechar aviso"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Waiting for Host video stream loader (unblurred, clear instructions) */}
       {!isWebRtcPlaying && !fallbackFrame && !hasReceivedFirstFrame && (
@@ -326,7 +539,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
           }
         }}
         onEmptied={() => setIsWebRtcPlaying(false)}
-        className={`w-full h-full object-contain pointer-events-none transition-opacity duration-300 ${
+        className={`w-full h-full object-contain pointer-events-none ${
           isWebRtcPlaying ? "opacity-100" : "opacity-0 absolute inset-0"
         }`}
       />
@@ -335,6 +548,20 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       <div
         ref={captureOverlayRef}
         data-testid="remote-input-capture"
+        onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const video = videoRef.current;
+          const fs = fallbackFrameSizeRef.current;
+          const norm = calculateNormalizedCoordinates(
+            e.clientX,
+            e.clientY,
+            rect,
+            video?.videoWidth || fs?.width || 0,
+            video?.videoHeight || fs?.height || 0
+          );
+          setIsPointerOverVideo(!norm.outOfBounds);
+        }}
+        onMouseLeave={() => setIsPointerOverVideo(false)}
         onMouseDown={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           setClickRipple({
@@ -344,7 +571,11 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
           });
         }}
         className={`absolute inset-0 z-[5] pointer-events-auto outline-none ${
-          permissions.allowInput ? "cursor-default" : "cursor-not-allowed"
+          !permissions.allowInput
+            ? "cursor-not-allowed"
+            : showRemoteCursorOnly
+              ? "cursor-none"
+              : "cursor-default"
         }`}
       />
 
@@ -399,6 +630,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         onClose={() => setIsFilesOpen(false)}
         activeProgress={activeTransferProgress}
         onSendFile={onSendFile}
+        {...(onSendFiles ? { onSendFiles: (files: File[]) => onSendFiles(files, { autoPaste: false }) } : {})}
         receivedFiles={receivedFiles}
       />
     </div>

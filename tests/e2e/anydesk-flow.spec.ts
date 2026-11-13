@@ -1,4 +1,120 @@
 import { test, expect } from "@playwright/test";
+import http from "node:http";
+import crypto from "node:crypto";
+
+async function startMockWindowsAgent() {
+  const receivedPackets: Array<Record<string, unknown>> = [];
+  const sockets = new Set<import("node:stream").Duplex>();
+
+  const server = http.createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      res.end(JSON.stringify({ ok: true, platform: "windows", port }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  server.on("upgrade", (req, socket) => {
+    const key = req.headers["sec-websocket-key"];
+    if (!key) {
+      socket.destroy();
+      return;
+    }
+    const accept = crypto
+      .createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64");
+
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    sockets.add(socket);
+
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const hello = Buffer.from(JSON.stringify({ type: "hello", platform: "windows", port }), "utf8");
+    socket.write(Buffer.concat([Buffer.from([0x81, hello.length]), hello]));
+
+    let buf = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 2) {
+        const opcode = buf[0]! & 0x0f;
+        const masked = (buf[1]! & 0x80) !== 0;
+        let payloadLen = buf[1]! & 0x7f;
+        let offset = 2;
+        if (payloadLen === 126) {
+          if (buf.length < 4) return;
+          payloadLen = buf.readUInt16BE(2);
+          offset = 4;
+        }
+        const maskLen = masked ? 4 : 0;
+        if (buf.length < offset + maskLen + payloadLen) return;
+        const payload = Buffer.alloc(payloadLen);
+        if (masked) {
+          const mask = buf.subarray(offset, offset + 4);
+          for (let i = 0; i < payloadLen; i++) {
+            payload[i] = buf[offset + 4 + i]! ^ mask[i % 4]!;
+          }
+        } else {
+          buf.copy(payload, 0, offset, offset + payloadLen);
+        }
+        buf = buf.subarray(offset + maskLen + payloadLen);
+
+        if (opcode === 0x8) {
+          socket.end();
+          return;
+        }
+        if (opcode === 0x9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload]));
+          continue;
+        }
+        if (opcode === 0x1) {
+          try {
+            receivedPackets.push(JSON.parse(payload.toString("utf8")) as Record<string, unknown>);
+          } catch {
+            // ignore non-json
+          }
+        }
+      }
+    });
+
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => sockets.delete(socket));
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  return {
+    wsUrl: `ws://127.0.0.1:${port}`,
+    receivedPackets,
+    close: async () => {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
 
 test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => {
   test("Complete Multi-Instance Remote Desktop Workflow", async ({ browser }) => {
@@ -32,6 +148,10 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
     expect(hostIdText).toMatch(/^\d{3}\s\d{3}\s\d{3}$/);
     expect(clientIdText).toMatch(/^\d{3}\s\d{3}\s\d{3}$/);
     expect(hostIdText).not.toBe(clientIdText);
+
+    // Without native Windows Agent running, Dashboard offers 1-click download banner
+    await expect(pageHost.locator('[data-testid="windows-agent-banner"]')).toBeVisible();
+    await expect(pageHost.locator('[data-testid="download-agent-btn"]')).toBeVisible();
 
     // ========================================================
     // SCENARIO 2: Manual Handshake & WebRTC Session Establishment
@@ -88,8 +208,11 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
     // Verify input block status on host
     await expect(hostBlockInputBtn).toHaveAttribute("title", /Input Bloqueado/);
 
+    // Verify Host informs Client that OS-level agent is missing when running browser-only
+    await expect(pageClient.locator('[data-testid="view-only-warning"]')).toBeVisible({ timeout: 10000 });
+
     // ========================================================
-    // SCENARIO 4: Real-time Chat via WebRTC DataChannel
+    // SCENARIO 4: Real-time Chat via WebRTC DataChannel (UI Focus Not Hijacked)
     // ========================================================
     // Client opens chat drawer
     const clientChatToggle = pageClient.locator('[data-testid="toggle-chat-btn"]');
@@ -97,6 +220,9 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
 
     const clientChatInput = pageClient.locator('[data-testid="chat-input"]');
     await expect(clientChatInput).toBeVisible({ timeout: 5000 });
+    await clientChatInput.click();
+    const isFocused = await clientChatInput.evaluate((el) => document.activeElement === el);
+    expect(isFocused).toBe(true);
     await clientChatInput.fill("Olá do Cliente remoto! Teste de Ultra-Baixa Latência WebRTC.");
 
     const clientChatSend = pageClient.locator('[data-testid="chat-send-btn"]');
@@ -250,5 +376,108 @@ test.describe("PulseDesk Pro E2E - Full AnyDesk Parity & Security Suite", () => 
 
     await contextHost.close();
     await contextClient.close();
+  });
+
+  test("Host forwards Client clicks & keystrokes via local Windows Agent loopback WebSocket", async ({
+    browser,
+  }) => {
+    const mockAgent = await startMockWindowsAgent();
+    const contextHost = await browser.newContext();
+    const contextClient = await browser.newContext();
+
+    const pageHost = await contextHost.newPage();
+    const pageClient = await contextClient.newPage();
+
+    await pageHost.addInitScript((agentUrl: string) => {
+      localStorage.setItem("omnidesk_agent_url", agentUrl);
+    }, mockAgent.wsUrl);
+
+    try {
+      await pageHost.goto("http://localhost:5173");
+      await pageClient.goto("http://localhost:5173");
+
+      const hostIdDisplay = pageHost.locator('[data-testid="device-id-display"]');
+      const clientIdDisplay = pageClient.locator('[data-testid="device-id-display"]');
+      await expect(hostIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
+      await expect(clientIdDisplay).not.toHaveText("Obtendo ID...", { timeout: 10000 });
+      const hostIdText = (await hostIdDisplay.innerText()).trim();
+
+      // Host Dashboard detects native Windows Agent
+      await expect(pageHost.locator('[data-testid="windows-agent-banner"]')).toContainText(
+        "Controle Nativo Windows Ativo",
+        { timeout: 10000 }
+      );
+
+      await pageClient.locator('[data-testid="remote-id-input"]').fill(hostIdText);
+      await pageClient.locator('[data-testid="connect-button"]').click();
+
+      await expect(pageHost.locator('[data-testid="incoming-request-modal"]')).toBeVisible({
+        timeout: 10000,
+      });
+      await pageHost.locator('[data-testid="accept-request-btn"]').click();
+
+      await expect(pageHost.locator('[data-testid="host-active-bar"]')).toBeVisible({ timeout: 10000 });
+      await expect(pageHost.locator('[data-testid="host-native-control-badge"]')).toBeVisible({
+        timeout: 10000,
+      });
+      await expect(pageClient.locator('[data-testid="remote-viewport"]')).toBeVisible({ timeout: 10000 });
+      await expect(pageClient.locator('[data-testid="waiting-video-overlay"]')).toBeHidden({
+        timeout: 15000,
+      });
+
+      // With Host agent active, Client should not show view-only warning
+      await expect(pageClient.locator('[data-testid="view-only-warning"]')).toBeHidden();
+
+      // Client can still click & type inside ChatDrawer without InputController stealing focus
+      await pageClient.locator('[data-testid="toggle-chat-btn"]').click();
+      const chatInput = pageClient.locator('[data-testid="chat-input"]');
+      await chatInput.click();
+      await expect(chatInput).toBeFocused();
+      await pageClient.locator('[data-testid="toggle-chat-btn"]').click();
+
+      // Click directly on remote capture overlay and send keystroke
+      const captureOverlay = pageClient.locator('[data-testid="remote-input-capture"]');
+      await expect(captureOverlay).toBeVisible();
+      await captureOverlay.click({ position: { x: 240, y: 180 } });
+      await pageClient.keyboard.press("KeyK");
+
+      await expect
+        .poll(
+          () => ({
+            mouseDown: mockAgent.receivedPackets.some(
+              (p) => p.kind === "mouse-down" && p.button === "left"
+            ),
+            mouseUp: mockAgent.receivedPackets.some(
+              (p) => p.kind === "mouse-up" && p.button === "left"
+            ),
+            keyDown: mockAgent.receivedPackets.some(
+              (p) => p.kind === "key-down" && p.code === "KeyK"
+            ),
+            keyUp: mockAgent.receivedPackets.some(
+              (p) => p.kind === "key-up" && p.code === "KeyK"
+            ),
+          }),
+          { timeout: 10000 }
+        )
+        .toEqual({
+          mouseDown: true,
+          mouseUp: true,
+          keyDown: true,
+          keyUp: true,
+        });
+
+      await pageClient.locator('[data-testid="end-session-btn"]').click();
+      await expect(hostIdDisplay).toBeVisible({ timeout: 10000 });
+
+      await expect
+        .poll(() => mockAgent.receivedPackets.some((p) => p.kind === "release-all"), {
+          timeout: 5000,
+        })
+        .toBe(true);
+    } finally {
+      await contextHost.close();
+      await contextClient.close();
+      await mockAgent.close();
+    }
   });
 });

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Info, X } from "lucide-react";
+import { AlertTriangle, Info, X } from "lucide-react";
 import { InputController } from "../core/input-controller";
 import { SessionHUD } from "./SessionHUD";
 import { ChatDrawer } from "./ChatDrawer";
@@ -20,6 +20,7 @@ interface RemoteSessionViewportProps {
   onSendSpecialKey: (action: "ctrl-alt-del" | "lock" | "esc") => void;
   onEndSession: () => void;
   onWebRtcVideoActiveChange?: (active: boolean) => void;
+  hostNativeControlActive?: boolean | null;
   chatMessages: ChatMessagePacket[];
   onSendChatMessage: (text: string) => void;
   localSenderName: string;
@@ -41,6 +42,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   onSendSpecialKey,
   onEndSession,
   onWebRtcVideoActiveChange,
+  hostNativeControlActive = null,
   chatMessages,
   onSendChatMessage,
   localSenderName,
@@ -50,16 +52,25 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   isHost,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const captureOverlayRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const inputControllerRef = useRef<InputController | null>(null);
   const onWebRtcVideoActiveChangeRef = useRef(onWebRtcVideoActiveChange);
   onWebRtcVideoActiveChangeRef.current = onWebRtcVideoActiveChange;
+  const onSendInputPacketRef = useRef(onSendInputPacket);
+  onSendInputPacketRef.current = onSendInputPacket;
+  const onEndSessionRef = useRef(onEndSession);
+  onEndSessionRef.current = onEndSession;
+  const allowInputRef = useRef(permissions.allowInput);
+  allowInputRef.current = permissions.allowInput;
 
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isFilesOpen, setIsFilesOpen] = useState(false);
   const [quality, setQuality] = useState<"performance" | "balanced" | "original">("balanced");
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [showMirrorTip, setShowMirrorTip] = useState(true);
+  const [showViewOnlyNotice, setShowViewOnlyNotice] = useState(true);
+  const [clickRipple, setClickRipple] = useState<{ x: number; y: number; key: number } | null>(null);
   const [isWebRtcPlaying, setIsWebRtcPlaying] = useState(false);
   const [hasReceivedFirstFrame, setHasReceivedFirstFrame] = useState(false);
 
@@ -129,12 +140,12 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
           setIsFilesOpen(false);
           return;
         }
-        onEndSession();
+        onEndSessionRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onEndSession, isChatOpen, isFilesOpen]);
+  }, [isChatOpen, isFilesOpen]);
 
   // Setup 60fps video frame callback telemetry
   useEffect(() => {
@@ -154,22 +165,22 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     };
   }, []);
 
-  // Setup InputController if not host (Client controls Host)
+  // Setup InputController strictly on the capture overlay (never steals clicks/keys from HUD or Drawers)
   useEffect(() => {
     if (isHost) return;
 
     const controller = new InputController({
       onInputPacket: (packet) => {
-        if (permissions.allowInput) {
-          onSendInputPacket(packet);
+        if (allowInputRef.current) {
+          onSendInputPacketRef.current(packet);
         }
       },
     });
 
     inputControllerRef.current = controller;
 
-    if (containerRef.current && videoRef.current) {
-      controller.attach(containerRef.current, videoRef.current);
+    if (captureOverlayRef.current && videoRef.current) {
+      controller.attach(captureOverlayRef.current, videoRef.current);
       if (fallbackFrameSize) {
         controller.setFallbackDimensions(fallbackFrameSize.width, fallbackFrameSize.height);
       }
@@ -179,7 +190,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       controller.detach();
       inputControllerRef.current = null;
     };
-  }, [isHost, permissions.allowInput, onSendInputPacket]);
+  }, [isHost]);
 
   // Handle unread messages
   useEffect(() => {
@@ -200,21 +211,24 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       ref={containerRef}
       className="relative w-screen h-screen bg-black overflow-hidden flex items-center justify-center select-none cursor-default outline-none"
     >
-      {/* Fixed Emergency Escape Button - Always visible and clickable */}
-      <button
-        onClick={onEndSession}
-        className="fixed top-4 right-4 z-[9999] pointer-events-auto flex items-center gap-2 px-3.5 py-2 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white font-medium text-xs shadow-xl shadow-rose-950/50 border border-rose-400/30 transition-all cursor-pointer group"
-        title="Encerrar sessão e voltar ao painel (ESC)"
-      >
-        <X className="w-4 h-4 group-hover:rotate-90 transition-transform" />
-        <span>Encerrar (ESC)</span>
-      </button>
+      {/* Fixed Emergency Escape Button - Hidden when right drawer is open so drawer close button stays unobstructed */}
+      {!isChatOpen && !isFilesOpen && (
+        <button
+          onClick={onEndSession}
+          className="fixed top-4 right-4 z-30 pointer-events-auto flex items-center gap-2 px-3.5 py-2 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white font-medium text-xs shadow-xl shadow-rose-950/50 border border-rose-400/30 transition-all cursor-pointer group"
+          title="Encerrar sessão e voltar ao painel (ESC)"
+        >
+          <X className="w-4 h-4 group-hover:rotate-90 transition-transform" />
+          <span>Encerrar (ESC)</span>
+        </button>
+      )}
 
       {/* Session Top HUD */}
       <SessionHUD
         telemetry={telemetry}
         isFallbackRelay={!isWebRtcPlaying && Boolean(fallbackFrame)}
         {...(relayStats ? { relayStats } : {})}
+        hostNativeControlActive={hostNativeControlActive}
         permissions={permissions}
         onToggleInputBlock={onToggleInputBlock}
         onSendSpecialKey={onSendSpecialKey}
@@ -243,18 +257,24 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
 
       {/* Info Tip for Self-Testing to Explain the Droste / Mirror Effect */}
       {showMirrorTip && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-4 py-2 rounded-xl bg-slate-900/95 border border-cyan-500/30 text-xs text-slate-200 shadow-2xl max-w-lg">
-          <Info className="w-4 h-4 text-cyan-400 shrink-0" />
-          <span className="flex-1">
-            <strong>Dica de Uso:</strong> Ao testar no mesmo computador, compartilhe uma <em>Janela Específica</em> ou use outro PC/celular para evitar o efeito de túnel de espelhos.
-          </span>
-          <button
-            onClick={() => setShowMirrorTip(false)}
-            className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white"
-            title="Fechar aviso"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+        <div
+          className={`fixed top-16 left-0 ${
+            isChatOpen || isFilesOpen ? "right-0 sm:right-96" : "right-0"
+          } z-30 pointer-events-none flex justify-center px-3 transition-all`}
+        >
+          <div className="pointer-events-auto flex items-center gap-2.5 px-4 py-2 rounded-xl bg-slate-900/95 border border-cyan-500/30 text-xs text-slate-200 shadow-2xl max-w-lg">
+            <Info className="w-4 h-4 text-cyan-400 shrink-0" />
+            <span className="flex-1">
+              <strong>Dica de Uso:</strong> Ao testar no mesmo computador, compartilhe uma <em>Janela Específica</em> ou use outro PC/celular para evitar o efeito de túnel de espelhos.
+            </span>
+            <button
+              onClick={() => setShowMirrorTip(false)}
+              className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white"
+              title="Fechar aviso"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -311,8 +331,59 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         }`}
       />
 
-      {/* Transparent pointer capture overlay */}
-      <div className="absolute inset-0 pointer-events-auto" />
+      {/* Transparent pointer capture overlay covering ONLY the remote video area */}
+      <div
+        ref={captureOverlayRef}
+        data-testid="remote-input-capture"
+        onMouseDown={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          setClickRipple({
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+            key: Date.now(),
+          });
+        }}
+        className={`absolute inset-0 z-[5] pointer-events-auto outline-none ${
+          permissions.allowInput ? "cursor-default" : "cursor-not-allowed"
+        }`}
+      />
+
+      {/* Brief visual click ripple so client sees immediate click capture feedback */}
+      {clickRipple && (
+        <div
+          key={clickRipple.key}
+          style={{ left: clickRipple.x - 10, top: clickRipple.y - 10 }}
+          className="fixed w-5 h-5 rounded-full border-2 border-cyan-400/80 pointer-events-none z-[6] animate-ping"
+          onAnimationEnd={() => setClickRipple(null)}
+        />
+      )}
+
+      {/* Clear warning when Host is in Browser-Only Mode without Windows Agent */}
+      {hostNativeControlActive === false && showViewOnlyNotice && (
+        <div
+          className={`fixed bottom-4 left-0 ${
+            isChatOpen || isFilesOpen ? "right-0 sm:right-96" : "right-0"
+          } z-40 pointer-events-none flex justify-center px-4 transition-all`}
+        >
+          <div
+            data-testid="view-only-warning"
+            className="pointer-events-auto flex items-center gap-3 px-4 py-2.5 rounded-xl bg-amber-950/95 border border-amber-500/40 text-xs text-amber-200 shadow-2xl max-w-2xl"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="flex-1">
+              <strong>Modo Visualização no Host:</strong> O computador Host está rodando apenas no navegador sem o{" "}
+              <strong>Agente Windows OmniDesk</strong> aberto. Para clicar nos ícones/programas do Windows lá, peça para o Host baixar e abrir o Agente na barra superior dele.
+            </span>
+            <button
+              onClick={() => setShowViewOnlyNotice(false)}
+              className="p-1 rounded-lg hover:bg-amber-900/60 text-amber-300 hover:text-white cursor-pointer"
+              title="Fechar aviso"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Side Drawers */}
       <ChatDrawer

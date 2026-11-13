@@ -8,7 +8,7 @@ import { FileTransferDrawer } from "./components/FileTransferDrawer";
 import { WebRTCManager, type TelemetryStats } from "./core/webrtc-manager";
 import { ACLGuard } from "./core/acl-guard";
 import { FileSender, FileReceiver, type FileTransferProgress } from "./core/file-transfer";
-import { nativeBridge } from "./core/native-bridge";
+import { nativeBridge, type ControlBridgeStatus } from "./core/native-bridge";
 import { FrameRelayHost } from "./core/frame-relay";
 import {
   generateNonce,
@@ -139,6 +139,10 @@ export const App: React.FC = () => {
     bitrateKbps: 0,
   });
   const [hostIsSyntheticStream, setHostIsSyntheticStream] = useState<boolean>(false);
+  const [controlBridgeStatus, setControlBridgeStatus] = useState<ControlBridgeStatus>(() =>
+    nativeBridge.getControlStatus()
+  );
+  const [hostNativeControlActive, setHostNativeControlActive] = useState<boolean | null>(null);
 
   // Chat & File Transfer State
   const [chatMessages, setChatMessages] = useState<ChatMessagePacket[]>([]);
@@ -252,6 +256,18 @@ export const App: React.FC = () => {
   useEffect(() => {
     defaultAclRef.current = defaultAcl;
   }, [defaultAcl]);
+
+  // Discover local Windows Native Agent (127.0.0.1:47831) for OS-level mouse/keyboard control
+  useEffect(() => {
+    nativeBridge.startAgentDiscovery();
+    const unsubscribe = nativeBridge.subscribeControlStatus((status) => {
+      setControlBridgeStatus(status);
+    });
+    return () => {
+      unsubscribe();
+      nativeBridge.stopAgentDiscovery();
+    };
+  }, []);
 
   // Persist recent sessions
   useEffect(() => {
@@ -682,6 +698,7 @@ export const App: React.FC = () => {
                 aclGuardRef.current.setAll(msg.permissions);
                 remotePeerIdRef.current = msg.senderId;
                 sessionRoleRef.current = "client";
+                setHostNativeControlActive(null);
                 setRemotePeerId(msg.senderId);
                 setSessionRole("client");
                 setSessionActive(true);
@@ -768,6 +785,12 @@ export const App: React.FC = () => {
                   } else {
                     frameRelayRef.current?.resume();
                   }
+                } else if (
+                  sessionRoleRef.current === "client" &&
+                  msg.senderId === remotePeerIdRef.current &&
+                  typeof msg.nativeControlActive === "boolean"
+                ) {
+                  setHostNativeControlActive(msg.nativeControlActive);
                 }
                 break;
               }
@@ -914,7 +937,7 @@ export const App: React.FC = () => {
   };
 
   // Host upgrades synthetic unattended stream to a real user-selected screen
-  const handleShareRealScreen = async () => {
+  const handleShareRealScreen = useCallback(async () => {
     if (sessionRoleRef.current !== "host") return;
     try {
       const newStream = await nativeBridge.captureScreen(undefined, { allowSyntheticFallback: false });
@@ -926,7 +949,15 @@ export const App: React.FC = () => {
     } catch (err) {
       console.warn("[App] Host cancelled real screen switch:", err);
     }
-  };
+  }, []);
+
+  const handleDownloadWindowsAgent = useCallback(() => {
+    nativeBridge.startFastAgentPolling(180_000);
+  }, []);
+
+  const handleVerifyAgent = useCallback(() => {
+    void nativeBridge.probeAgentNow();
+  }, []);
 
   // Host Rejects Connection via Modal
   const handleRejectIncoming = (reason: string) => {
@@ -941,8 +972,8 @@ export const App: React.FC = () => {
   };
 
   // Toggle Input Block in real time (Host ACL Guard)
-  const handleToggleInputBlock = () => {
-    const newPerms = { ...activeAcl, allowInput: !activeAcl.allowInput };
+  const handleToggleInputBlock = useCallback(() => {
+    const newPerms = { ...activeAclRef.current, allowInput: !activeAclRef.current.allowInput };
     setActiveAcl(newPerms);
     activeAclRef.current = newPerms;
     aclGuardRef.current.updatePermissions(newPerms);
@@ -951,35 +982,44 @@ export const App: React.FC = () => {
       kind: "acl-update",
       permissions: newPerms,
     });
-  };
+  }, [sendControlPacketWithFallback]);
 
   // Send input packet (Client -> Host)
-  const handleSendInputPacket = (packet: InputPacket) => {
-    if (activeAclRef.current.allowInput) {
-      sendControlPacketWithFallback(packet);
-    }
-  };
+  const handleSendInputPacket = useCallback(
+    (packet: InputPacket) => {
+      if (activeAclRef.current.allowInput) {
+        sendControlPacketWithFallback(packet);
+      }
+    },
+    [sendControlPacketWithFallback]
+  );
 
   // Send Special Key
-  const handleSendSpecialKey = (action: "ctrl-alt-del" | "lock" | "esc") => {
-    sendControlPacketWithFallback({
-      kind: "special-key",
-      action,
-    });
-  };
+  const handleSendSpecialKey = useCallback(
+    (action: "ctrl-alt-del" | "lock" | "esc") => {
+      sendControlPacketWithFallback({
+        kind: "special-key",
+        action,
+      });
+    },
+    [sendControlPacketWithFallback]
+  );
 
   // Send Chat Message
-  const handleSendChatMessage = (text: string) => {
-    const packet: ChatMessagePacket = {
-      kind: "chat-message",
-      id: safeRandomUUID(),
-      sender: deviceName,
-      text,
-      timestamp: Date.now(),
-    };
-    setChatMessages((prev) => [...prev, packet]);
-    sendControlPacketWithFallback(packet);
-  };
+  const handleSendChatMessage = useCallback(
+    (text: string) => {
+      const packet: ChatMessagePacket = {
+        kind: "chat-message",
+        id: safeRandomUUID(),
+        sender: deviceName,
+        text,
+        timestamp: Date.now(),
+      };
+      setChatMessages((prev) => [...prev, packet]);
+      sendControlPacketWithFallback(packet);
+    },
+    [deviceName, sendControlPacketWithFallback]
+  );
 
   // Send File
   const handleSendFile = async (file: File) => {
@@ -1025,6 +1065,7 @@ export const App: React.FC = () => {
         hostStreamRef.current = null;
       }
       setHostIsSyntheticStream(false);
+      setHostNativeControlActive(null);
       setFallbackFrame(null);
       setFallbackFrameSize(null);
       setRelayStats({ fps: 0, bitrateKbps: 0 });
@@ -1060,6 +1101,23 @@ export const App: React.FC = () => {
 
   handleEndSessionRef.current = handleEndSession;
 
+  const handleEndSessionFromUI = useCallback(() => {
+    handleEndSession(true);
+  }, [handleEndSession]);
+
+  // Keep Client informed whether Host has OS-level control (Tauri or OmniDesk Windows Agent)
+  useEffect(() => {
+    if (sessionRole === "host" && remotePeerId && deviceIdRef.current) {
+      sendSignaling({
+        type: "video-status",
+        targetId: remotePeerId,
+        senderId: deviceIdRef.current,
+        webrtcActive: webrtcRef.current?.getConnectionState() === "connected",
+        nativeControlActive: controlBridgeStatus !== "browser-only",
+      });
+    }
+  }, [sessionRole, remotePeerId, controlBridgeStatus, sendSignaling]);
+
   const handleWebRtcVideoActiveChange = useCallback(
     (active: boolean) => {
       if (sessionRoleRef.current === "client" && remotePeerIdRef.current && deviceIdRef.current) {
@@ -1088,8 +1146,9 @@ export const App: React.FC = () => {
           onSendInputPacket={handleSendInputPacket}
           onToggleInputBlock={handleToggleInputBlock}
           onSendSpecialKey={handleSendSpecialKey}
-          onEndSession={() => handleEndSession(true)}
+          onEndSession={handleEndSessionFromUI}
           onWebRtcVideoActiveChange={handleWebRtcVideoActiveChange}
+          hostNativeControlActive={hostNativeControlActive}
           chatMessages={chatMessages}
           onSendChatMessage={handleSendChatMessage}
           localSenderName={deviceName}
@@ -1123,6 +1182,9 @@ export const App: React.FC = () => {
               unreadChatCount={chatMessages.length}
               isSyntheticStream={hostIsSyntheticStream}
               onShareRealScreen={handleShareRealScreen}
+              controlBridgeStatus={controlBridgeStatus}
+              onDownloadWindowsAgent={handleDownloadWindowsAgent}
+              onVerifyAgent={handleVerifyAgent}
             />
           )}
 
@@ -1152,6 +1214,9 @@ export const App: React.FC = () => {
               onToggleSyntheticStream={handleToggleSyntheticStream}
               signalingUrl={signalingUrl}
               onUpdateSignalingUrl={handleUpdateSignalingUrl}
+              controlBridgeStatus={controlBridgeStatus}
+              onDownloadWindowsAgent={handleDownloadWindowsAgent}
+              onVerifyAgent={handleVerifyAgent}
             />
           </div>
 

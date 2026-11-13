@@ -213,6 +213,7 @@ export const VideoStatusMsgSchema = z.object({
   targetId: z.string().regex(DEVICE_ID_REGEX),
   senderId: z.string().length(9),
   webrtcActive: z.boolean(),
+  nativeControlActive: z.boolean().optional(),
 });
 export type VideoStatusMsg = z.infer<typeof VideoStatusMsgSchema>;
 

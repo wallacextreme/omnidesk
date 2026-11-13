@@ -8,9 +8,13 @@ import {
   Activity,
   Monitor,
   Laptop,
+  Download,
+  CheckCircle2,
+  RefreshCw,
 } from "lucide-react";
 import { formatDeviceId, type ACLPermissions } from "../shared/protocol";
 import type { TelemetryStats } from "../core/webrtc-manager";
+import type { ControlBridgeStatus } from "../core/native-bridge";
 
 interface HostActiveSessionBarProps {
   remotePeerId: string;
@@ -24,6 +28,9 @@ interface HostActiveSessionBarProps {
   unreadChatCount?: number;
   isSyntheticStream?: boolean;
   onShareRealScreen?: () => void;
+  controlBridgeStatus?: ControlBridgeStatus;
+  onDownloadWindowsAgent?: () => void;
+  onVerifyAgent?: () => void;
 }
 
 export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
@@ -38,7 +45,11 @@ export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
   unreadChatCount = 0,
   isSyntheticStream = false,
   onShareRealScreen,
+  controlBridgeStatus = "browser-only",
+  onDownloadWindowsAgent,
+  onVerifyAgent,
 }) => {
+  const hasNativeControl = controlBridgeStatus !== "browser-only";
   return (
     <aside
       data-testid="host-active-bar"
@@ -75,7 +86,41 @@ export const HostActiveSessionBar: React.FC<HostActiveSessionBarProps> = ({
         </div>
 
         {/* Center/Right: ACL Controls & Actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {hasNativeControl ? (
+            <span
+              data-testid="host-native-control-badge"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-500/10 border border-emerald-500/30 text-emerald-300"
+              title="Mouse e teclado remotos conectados ao Windows"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Controle SO Ativo</span>
+            </span>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <a
+                href="/downloads/OmniDesk-Agente-Windows.zip"
+                download="OmniDesk-Agente-Windows.zip"
+                onClick={onDownloadWindowsAgent}
+                data-testid="host-download-agent-btn"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 transition-colors cursor-pointer"
+                title="Sem o Agente Windows, o visitante apenas vê sua tela. Baixe e execute para permitir cliques reais no Windows."
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Ativar Cliques no Windows</span>
+              </a>
+              {onVerifyAgent && (
+                <button
+                  onClick={onVerifyAgent}
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer"
+                  title="Verificar conexão com o Agente Windows (127.0.0.1:47831)"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
           {isSyntheticStream && onShareRealScreen && (
             <button
               data-testid="share-real-screen-btn"

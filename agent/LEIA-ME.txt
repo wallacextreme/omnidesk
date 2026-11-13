@@ -1,0 +1,20 @@
+OmniDesk Pro — Agente de Controle Windows (Windows 7 / 8 / 10 / 11)
+=======================================================================
+
+Por que este agente existe?
+Navegadores (Google Chrome / Edge) bloqueiam páginas web de moverem o mouse ou
+clicarem fora da aba do navegador por segurança. Para que quem se conecta ao seu
+computador (Host) consiga clicar na Área de Trabalho, Menu Iniciar e programas
+do Windows, execute o agente neste computador Host.
+
+Como usar (10 segundos):
+1. Extraia este arquivo .zip (ou dê um duplo clique em "OmniDesk-Agente.exe").
+2. Uma pequena janela "OmniDesk Agente Windows Ativo" será aberta na porta 127.0.0.1:47831.
+3. Volte ao navegador em https://omnidesk-remote.web.app — o status mudará
+   automaticamente para verde ("Controle Nativo SO Ativo").
+4. Quando terminar a sessão remota, basta clicar em "Encerrar Agente".
+
+Segurança Zero-Trust:
+- O agente aceita conexões SOMENTE deste computador (127.0.0.1, nunca da rede externa)
+  e SOMENTE vindas da origem oficial https://omnidesk-remote.web.app (ou localhost em dev).
+- O código-fonte completo está incluído em OmniDeskAgent.cs.

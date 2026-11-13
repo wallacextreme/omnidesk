@@ -23,9 +23,13 @@ import {
   Server,
   Settings2,
   X,
+  Download,
+  RefreshCw,
+  CheckCircle2,
 } from "lucide-react";
 import { formatDeviceId, type ACLPermissions } from "../shared/protocol";
 import type { SignalingMode, SignalingStatus } from "../core/signaling-client";
+import type { ControlBridgeStatus } from "../core/native-bridge";
 
 export interface RecentSession {
   id: string;
@@ -53,6 +57,9 @@ interface DashboardProps {
   onToggleSyntheticStream?: (enabled: boolean) => void;
   signalingUrl?: string;
   onUpdateSignalingUrl?: (url: string) => void;
+  controlBridgeStatus?: ControlBridgeStatus;
+  onDownloadWindowsAgent?: () => void;
+  onVerifyAgent?: () => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
@@ -74,6 +81,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onToggleSyntheticStream,
   signalingUrl = "ws://localhost:4000",
   onUpdateSignalingUrl,
+  controlBridgeStatus = "browser-only",
+  onDownloadWindowsAgent,
+  onVerifyAgent,
 }) => {
   const [remoteInput, setRemoteInput] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -181,6 +191,63 @@ export const Dashboard: React.FC<DashboardProps> = ({
           )}
         </div>
       )}
+
+      {/* Native Windows Input Agent Status & 1-Click Enabler */}
+      <div
+        data-testid="windows-agent-banner"
+        className={`mb-6 p-3.5 rounded-xl border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+          controlBridgeStatus !== "browser-only"
+            ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-200"
+            : "bg-slate-900/80 border-cyan-500/25 text-slate-300"
+        }`}
+      >
+        <div className="flex items-start sm:items-center gap-2.5">
+          {controlBridgeStatus !== "browser-only" ? (
+            <>
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" />
+              <div>
+                <span className="font-semibold text-emerald-300">Controle Nativo Windows Ativo:</span>{" "}
+                Quem se conectar a este dispositivo poderá clicar, arrastar e digitar em qualquer programa do Windows.
+              </div>
+            </>
+          ) : (
+            <>
+              <MousePointer className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5 sm:mt-0" />
+              <div>
+                <span className="font-semibold text-white">Permitir cliques e teclado neste PC (Host):</span>{" "}
+                Navegadores bloqueiam controle fora da aba por segurança. Baixe e abra o{" "}
+                <span className="text-cyan-300 font-medium">OmniDesk Agente Windows</span> no computador que será acessado.
+              </div>
+            </>
+          )}
+        </div>
+
+        {controlBridgeStatus === "browser-only" && (
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href="/downloads/OmniDesk-Agente-Windows.zip"
+              download="OmniDesk-Agente-Windows.zip"
+              onClick={onDownloadWindowsAgent}
+              data-testid="download-agent-btn"
+              className="px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs transition-colors flex items-center gap-1.5 shadow-md shadow-cyan-600/25"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Baixar Agente (.zip)</span>
+            </a>
+            {onVerifyAgent && (
+              <button
+                type="button"
+                onClick={onVerifyAgent}
+                className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs transition-colors flex items-center gap-1 cursor-pointer"
+                title="Detectar se o Agente Windows já está em execução"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Verificar</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Signaling Configuration Modal */}
       {showConfigModal && (

@@ -1,4 +1,4 @@
-const CACHE_NAME = "omnidesk-v2";
+const CACHE_NAME = "omnidesk-v3";
 const STATIC_ASSETS = ["/", "/index.html", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
@@ -22,16 +22,17 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
-  // Do not intercept WebSocket, external origins, or non-GET requests
+  // Do not intercept WebSocket, downloadable binaries/zips, external origins, or non-GET requests
+  const url = new URL(event.request.url);
   if (
     event.request.method !== "GET" ||
     event.request.url.startsWith("ws") ||
-    !event.request.url.startsWith(self.location.origin)
+    !event.request.url.startsWith(self.location.origin) ||
+    url.pathname.startsWith("/downloads/")
   ) {
     return;
   }
 
-  const url = new URL(event.request.url);
   const isHtmlOrManifest =
     event.request.mode === "navigate" ||
     url.pathname === "/" ||

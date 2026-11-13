@@ -30,10 +30,215 @@ declare global {
   }
 }
 
+export type ControlBridgeStatus = "tauri" | "agent-connected" | "browser-only";
+
 export class NativeBridge implements INativeBridge {
   private syntheticCanvas: HTMLCanvasElement | null = null;
   private syntheticAnimId: number | null = null;
   private forceSyntheticStream = false;
+  private agentWs: WebSocket | null = null;
+  private agentStatus: ControlBridgeStatus = "browser-only";
+  private statusListeners = new Set<(status: ControlBridgeStatus) => void>();
+  private probeInFlight = false;
+  private fastPollTimer: ReturnType<typeof setInterval> | null = null;
+  private idlePollTimer: ReturnType<typeof setInterval> | null = null;
+  private focusHandler: (() => void) | null = null;
+  private discoveryActive = false;
+
+  constructor() {
+    if (this.isDesktopApp()) {
+      this.agentStatus = "tauri";
+    }
+  }
+
+  public getControlStatus(): ControlBridgeStatus {
+    if (this.isDesktopApp()) return "tauri";
+    return this.agentStatus;
+  }
+
+  public hasNativeOSControl(): boolean {
+    const status = this.getControlStatus();
+    return status === "tauri" || status === "agent-connected";
+  }
+
+  public subscribeControlStatus(listener: (status: ControlBridgeStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    listener(this.getControlStatus());
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  private setControlStatus(next: ControlBridgeStatus): void {
+    if (this.agentStatus !== next) {
+      this.agentStatus = next;
+      for (const listener of this.statusListeners) {
+        try {
+          listener(next);
+        } catch {}
+      }
+    }
+  }
+
+  private getAgentWsUrl(): string {
+    try {
+      if (typeof localStorage !== "undefined") {
+        const custom = localStorage.getItem("omnidesk_agent_url");
+        if (custom && (custom.startsWith("ws://127.0.0.1") || custom.startsWith("ws://localhost"))) {
+          return custom;
+        }
+      }
+    } catch {}
+    return "ws://127.0.0.1:47831";
+  }
+
+  public startAgentDiscovery(): void {
+    if (typeof window === "undefined" || this.isDesktopApp() || this.discoveryActive) return;
+    this.discoveryActive = true;
+
+    const isWebDriver = Boolean((navigator as { webdriver?: boolean }).webdriver);
+    let hasCustomAgent = false;
+    try {
+      hasCustomAgent = Boolean(localStorage.getItem("omnidesk_agent_url"));
+    } catch {}
+
+    // Probe once on mount (skip background polling under WebDriver unless explicitly configured)
+    if (!isWebDriver || hasCustomAgent) {
+      void this.probeAgentNow();
+    }
+
+    this.focusHandler = () => {
+      if (!this.hasNativeOSControl()) {
+        void this.probeAgentNow();
+      }
+    };
+    window.addEventListener("focus", this.focusHandler);
+
+    if (!isWebDriver || hasCustomAgent) {
+      this.idlePollTimer = setInterval(() => {
+        if (this.discoveryActive && !this.hasNativeOSControl() && document.visibilityState === "visible") {
+          void this.probeAgentNow();
+        }
+      }, 15000);
+    }
+  }
+
+  public stopAgentDiscovery(): void {
+    this.discoveryActive = false;
+    if (this.fastPollTimer) {
+      clearInterval(this.fastPollTimer);
+      this.fastPollTimer = null;
+    }
+    if (this.idlePollTimer) {
+      clearInterval(this.idlePollTimer);
+      this.idlePollTimer = null;
+    }
+    if (this.focusHandler && typeof window !== "undefined") {
+      window.removeEventListener("focus", this.focusHandler);
+      this.focusHandler = null;
+    }
+  }
+
+  public startFastAgentPolling(durationMs = 60_000): void {
+    if (typeof window === "undefined" || this.isDesktopApp()) return;
+    if (this.fastPollTimer) {
+      clearInterval(this.fastPollTimer);
+    }
+    const deadline = Date.now() + durationMs;
+    void this.probeAgentNow();
+    this.fastPollTimer = setInterval(() => {
+      if (this.hasNativeOSControl() || Date.now() > deadline || !this.discoveryActive) {
+        if (this.fastPollTimer) {
+          clearInterval(this.fastPollTimer);
+          this.fastPollTimer = null;
+        }
+        return;
+      }
+      void this.probeAgentNow();
+    }, 2000);
+  }
+
+  public async probeAgentNow(): Promise<boolean> {
+    if (this.isDesktopApp()) {
+      this.setControlStatus("tauri");
+      return true;
+    }
+    if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
+      this.setControlStatus("agent-connected");
+      return true;
+    }
+    if (this.probeInFlight || typeof WebSocket === "undefined") {
+      return false;
+    }
+
+    this.probeInFlight = true;
+    const wsUrl = this.getAgentWsUrl();
+    const httpHealthUrl = wsUrl.replace(/^ws:/i, "http:").replace(/^wss:/i, "https:").replace(/\/$/, "") + "/health";
+
+    try {
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 800) : null;
+      const res = await fetch(httpHealthUrl, {
+        method: "GET",
+        mode: "cors",
+        cache: "no-store",
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      if (timer) clearTimeout(timer);
+      if (!res.ok) {
+        this.probeInFlight = false;
+        return false;
+      }
+    } catch {
+      this.probeInFlight = false;
+      this.setControlStatus("browser-only");
+      return false;
+    }
+
+    return new Promise<boolean>((resolve) => {
+      try {
+        const ws = new WebSocket(wsUrl);
+        const timeout = setTimeout(() => {
+          this.probeInFlight = false;
+          try {
+            ws.close();
+          } catch {}
+          resolve(false);
+        }, 1500);
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          this.probeInFlight = false;
+          this.agentWs = ws;
+          this.setControlStatus("agent-connected");
+          resolve(true);
+        };
+
+        ws.onclose = () => {
+          clearTimeout(timeout);
+          this.probeInFlight = false;
+          if (this.agentWs === ws) {
+            this.agentWs = null;
+          }
+          this.setControlStatus(this.isDesktopApp() ? "tauri" : "browser-only");
+        };
+
+        ws.onerror = () => {
+          clearTimeout(timeout);
+          this.probeInFlight = false;
+          if (this.agentWs === ws) {
+            this.agentWs = null;
+          }
+          this.setControlStatus(this.isDesktopApp() ? "tauri" : "browser-only");
+          resolve(false);
+        };
+      } catch {
+        this.probeInFlight = false;
+        this.setControlStatus("browser-only");
+        resolve(false);
+      }
+    });
+  }
 
   public setForceSyntheticStream(enabled: boolean): void {
     this.forceSyntheticStream = enabled;
@@ -188,16 +393,66 @@ export class NativeBridge implements INativeBridge {
       }
     }
 
-    // Browser / test fallback: dispatch synthetic DOM event or mock injection
-    if (typeof document !== "undefined") {
-      const target = document.getElementById("remote-viewport-container") ?? document.body;
-      if (packet.kind === "mouse-move") {
-        const event = new MouseEvent("mousemove", {
-          clientX: packet.x * window.innerWidth,
-          clientY: packet.y * window.innerHeight,
-          bubbles: true,
-        });
-        target.dispatchEvent(event);
+    // Native OS Windows Agent over trusted loopback bridge (127.0.0.1:47831)
+    if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
+      try {
+        this.agentWs.send(JSON.stringify(packet));
+        return true;
+      } catch (err) {
+        console.warn("[NativeBridge] Loopback agent send failed:", err);
+      }
+    }
+
+    // Browser-only DOM fallback (can interact only inside this browser tab)
+    if (typeof document !== "undefined" && typeof window !== "undefined") {
+      if (packet.kind === "mouse-move" || packet.kind === "mouse-down" || packet.kind === "mouse-up") {
+        const cx = packet.x * window.innerWidth;
+        const cy = packet.y * window.innerHeight;
+        const target =
+          (typeof document.elementFromPoint === "function" ? document.elementFromPoint(cx, cy) : null) ??
+          document.getElementById("remote-viewport-container") ??
+          document.body;
+
+        const buttonCode = packet.kind === "mouse-move" ? 0 : packet.button === "right" ? 2 : packet.button === "middle" ? 1 : 0;
+        const eventType =
+          packet.kind === "mouse-move" ? "mousemove" : packet.kind === "mouse-down" ? "mousedown" : "mouseup";
+
+        target.dispatchEvent(
+          new MouseEvent(eventType, {
+            clientX: cx,
+            clientY: cy,
+            button: buttonCode,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+
+        if (packet.kind === "mouse-up" && buttonCode === 0 && target instanceof HTMLElement) {
+          target.focus?.();
+          target.dispatchEvent(
+            new MouseEvent("click", {
+              clientX: cx,
+              clientY: cy,
+              button: 0,
+              bubbles: true,
+              cancelable: true,
+            })
+          );
+        }
+      } else if (packet.kind === "key-down" || packet.kind === "key-up") {
+        const target = (document.activeElement as HTMLElement | null) ?? document.body;
+        target.dispatchEvent(
+          new KeyboardEvent(packet.kind === "key-down" ? "keydown" : "keyup", {
+            key: packet.key,
+            code: packet.code,
+            altKey: packet.altKey,
+            ctrlKey: packet.ctrlKey,
+            shiftKey: packet.shiftKey,
+            metaKey: packet.metaKey,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
       }
     }
 
@@ -212,6 +467,11 @@ export class NativeBridge implements INativeBridge {
       } catch (err) {
         console.warn("[NativeBridge] Tauri release_all_inputs error:", err);
       }
+    }
+    if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
+      try {
+        this.agentWs.send(JSON.stringify({ kind: "release-all" }));
+      } catch {}
     }
     return true;
   }

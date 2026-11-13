@@ -9,6 +9,7 @@ import {
   calculateNormalizedCoordinates,
 } from "../../src/core/input-controller";
 import { sha256 } from "../../src/core/crypto";
+import { NativeBridge } from "../../src/core/native-bridge";
 import type { TransferChannelPacket } from "../../src/shared/protocol";
 
 describe("Phase 3: Input & File Transfer Quality Gate", () => {
@@ -173,6 +174,106 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       const receivedArrayBuffer = await receivedFile.blob.arrayBuffer();
       const receivedSha256 = await sha256(receivedArrayBuffer);
       expect(receivedSha256).toBe(expectedSha256);
+    });
+  });
+
+  describe("4. NativeBridge Loopback Agent WebSocket Dispatch", () => {
+    it("should connect to local Windows agent over loopback WS and forward input & release-all packets", async () => {
+      const receivedPackets: Array<Record<string, unknown>> = [];
+      const server = Bun.serve({
+        port: 0,
+        fetch(req, srv) {
+          const url = new URL(req.url);
+          if (url.pathname === "/health") {
+            return new Response(
+              JSON.stringify({ ok: true, platform: "windows", port: srv.port }),
+              {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }
+            );
+          }
+          if (srv.upgrade(req)) {
+            return;
+          }
+          return new Response("Not Found", { status: 404 });
+        },
+        websocket: {
+          open(ws) {
+            ws.send(JSON.stringify({ type: "hello", platform: "windows", port: server.port }));
+          },
+          message(_ws, message) {
+            try {
+              const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+              receivedPackets.push(JSON.parse(text) as Record<string, unknown>);
+            } catch {
+              // ignore non-json
+            }
+          },
+        },
+      });
+
+      const originalWindow = (globalThis as Record<string, unknown>).window;
+      const originalLocalStorage = (globalThis as Record<string, unknown>).localStorage;
+      const store = new Map<string, string>([
+        ["omnidesk_agent_url", `ws://127.0.0.1:${server.port}`],
+      ]);
+      const mockStorage = {
+        getItem: (key: string) => store.get(key) ?? null,
+        setItem: (key: string, val: string) => {
+          store.set(key, val);
+        },
+        removeItem: (key: string) => {
+          store.delete(key);
+        },
+      };
+
+      (globalThis as Record<string, unknown>).localStorage = mockStorage;
+      if (typeof originalWindow === "undefined") {
+        (globalThis as Record<string, unknown>).window = { localStorage: mockStorage };
+      }
+
+      const bridge = new NativeBridge();
+      try {
+        const connected = await bridge.probeAgentNow();
+        expect(connected).toBe(true);
+        expect(bridge.getControlStatus()).toBe("agent-connected");
+        expect(bridge.hasNativeOSControl()).toBe(true);
+
+        await bridge.injectInput({ kind: "mouse-down", button: "left", x: 0.5, y: 0.25 });
+        await bridge.injectInput({
+          kind: "key-down",
+          code: "KeyA",
+          key: "a",
+          ctrlKey: false,
+          altKey: false,
+          shiftKey: false,
+          metaKey: false,
+        });
+        await bridge.releaseAllInputs();
+
+        const deadline = Date.now() + 2000;
+        while (receivedPackets.length < 3 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+
+        expect(receivedPackets.some((p) => p.kind === "mouse-down" && p.button === "left" && p.x === 0.5 && p.y === 0.25)).toBe(true);
+        expect(receivedPackets.some((p) => p.kind === "key-down" && p.code === "KeyA" && p.key === "a")).toBe(true);
+        expect(receivedPackets.some((p) => p.kind === "release-all")).toBe(true);
+      } finally {
+        bridge.stopAgentDiscovery();
+        server.stop(true);
+        if (originalLocalStorage === undefined) {
+          delete (globalThis as Record<string, unknown>).localStorage;
+        } else {
+          (globalThis as Record<string, unknown>).localStorage = originalLocalStorage;
+        }
+        if (originalWindow === undefined) {
+          delete (globalThis as Record<string, unknown>).window;
+        } else {
+          (globalThis as Record<string, unknown>).window = originalWindow;
+        }
+      }
     });
   });
 });

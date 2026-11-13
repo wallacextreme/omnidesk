@@ -21,6 +21,7 @@ interface SessionHUDProps {
   telemetry: TelemetryStats;
   isFallbackRelay?: boolean;
   relayStats?: { fps: number; bitrateKbps: number };
+  hostNativeControlActive?: boolean | null;
   permissions: ACLPermissions;
   onToggleInputBlock: () => void;
   onSendSpecialKey: (action: "ctrl-alt-del" | "lock" | "esc") => void;
@@ -39,6 +40,7 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
   telemetry,
   isFallbackRelay = false,
   relayStats,
+  hostNativeControlActive = null,
   permissions,
   onToggleInputBlock,
   onSendSpecialKey,
@@ -82,22 +84,28 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
         ? "bg-amber-400"
         : "bg-rose-400";
 
+  const isDrawerOpen = isChatOpen || isFilesOpen;
+
   return (
-    <div className="fixed top-3 left-1/2 -translate-x-1/2 z-40 transition-all duration-300">
+    <div
+      className={`fixed top-3 left-0 ${
+        isDrawerOpen ? "right-0 sm:right-96" : "right-0"
+      } z-40 pointer-events-none flex justify-center px-2 transition-all duration-300`}
+    >
       {isCollapsed ? (
         <button
           onClick={() => setIsCollapsed(false)}
-          className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900/90 border border-slate-700 backdrop-blur-md shadow-2xl text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition"
+          className="pointer-events-auto flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900/90 border border-slate-700 backdrop-blur-md shadow-2xl text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition whitespace-nowrap"
         >
           <span className={`w-2 h-2 rounded-full ${isFallbackRelay ? "bg-cyan-400" : dotColor}`} />
           <span>{isFallbackRelay ? "WSS Relay" : telemetry.fps === 0 ? "Conectando..." : `${telemetry.rttMs} ms`}</span>
           <ChevronDown className="w-3.5 h-3.5" />
         </button>
       ) : (
-        <div className="flex items-center gap-2 p-1.5 rounded-2xl bg-slate-900/90 border border-slate-800/90 backdrop-blur-xl shadow-2xl shadow-black/80">
+        <div className="pointer-events-auto flex items-center gap-2 p-1.5 rounded-2xl bg-slate-900/90 border border-slate-800/90 backdrop-blur-xl shadow-2xl shadow-black/80 max-w-full overflow-x-auto">
           {/* Telemetry Indicator */}
           {isFallbackRelay ? (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium text-cyan-400 bg-cyan-500/10 border-cyan-500/20">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium text-cyan-400 bg-cyan-500/10 border-cyan-500/20 whitespace-nowrap shrink-0">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span>WSS Relay</span>
               <span className="text-slate-500">|</span>
@@ -110,12 +118,12 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
               )}
             </div>
           ) : telemetry.fps === 0 && telemetry.bitrateKbps === 0 ? (
-            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium whitespace-nowrap shrink-0 ${pingColor}`}>
               <span className={`w-2 h-2 rounded-full ${dotColor} animate-pulse`} />
               <span>Conectando...</span>
             </div>
           ) : (
-            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium ${pingColor}`}>
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-mono font-medium whitespace-nowrap shrink-0 ${pingColor}`}>
               <span className={`w-2 h-2 rounded-full ${dotColor} animate-pulse`} />
               <span>{telemetry.rttMs}ms</span>
               <span className="text-slate-500">|</span>
@@ -130,6 +138,23 @@ export const SessionHUD: React.FC<SessionHUDProps> = ({
           )}
 
           <div className="h-5 w-px bg-slate-800" />
+
+          {hostNativeControlActive !== null && (
+            <span
+              className={`px-2 py-1 rounded-lg text-[11px] font-medium border whitespace-nowrap shrink-0 ${
+                hostNativeControlActive
+                  ? "text-emerald-300 bg-emerald-500/10 border-emerald-500/20"
+                  : "text-amber-300 bg-amber-500/10 border-amber-500/25"
+              }`}
+              title={
+                hostNativeControlActive
+                  ? "Agente nativo ativo no Host: cliques e teclado funcionam em todo o Windows"
+                  : "Host no navegador sem Agente Windows: somente visualização"
+              }
+            >
+              {hostNativeControlActive ? "Controle SO" : "Somente Vídeo"}
+            </span>
+          )}
 
           {/* Quality Selector */}
           <div className="relative">

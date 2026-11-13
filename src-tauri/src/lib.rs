@@ -85,6 +85,15 @@ mod win_input {
         fn EmptyClipboard() -> i32;
         fn GetClipboardData(u_format: u32) -> *mut c_void;
         fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+        fn MessageBoxW(hwnd: *const c_void, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+    }
+
+    pub fn show_error_box(title: &str, body: &str) {
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = MessageBoxW(std::ptr::null(), body_w.as_ptr(), title_w.as_ptr(), 0x10);
+        }
     }
 
     #[link(name = "kernel32")]
@@ -730,7 +739,7 @@ pub fn run() {
     #[cfg(target_os = "windows")]
     win_input::ensure_dpi_aware();
 
-    tauri::Builder::default()
+    if let Err(err) = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::get_monitors,
             commands::inject_mouse_event,
@@ -741,5 +750,15 @@ pub fn run() {
             commands::save_received_file
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    {
+        #[cfg(target_os = "windows")]
+        win_input::show_error_box(
+            "OmniDesk - Erro ao iniciar",
+            &format!(
+                "Não foi possível inicializar a janela WebView2 do OmniDesk.\n\nNo Windows 7 (64 bits), certifique-se de instalar o Microsoft Edge WebView2 Runtime v109 (x64).\n\nDetalhes: {err}"
+            ),
+        );
+        #[cfg(not(target_os = "windows"))]
+        eprintln!("error while running tauri application: {err}");
+    }
 }

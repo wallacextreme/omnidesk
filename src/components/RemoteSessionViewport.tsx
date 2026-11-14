@@ -4,6 +4,7 @@ import {
   InputController,
   calculateNormalizedCoordinates,
 } from "../core/input-controller";
+import { nativeBridge } from "../core/native-bridge";
 import { SessionHUD } from "./SessionHUD";
 import { ChatDrawer } from "./ChatDrawer";
 import { FileTransferDrawer } from "./FileTransferDrawer";
@@ -249,6 +250,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   // AnyDesk-style Ctrl+C -> Ctrl+V (files & text) via browser paste event
   useEffect(() => {
     if (isHost) return;
+    let mounted = true;
 
     const handlePaste = (e: ClipboardEvent) => {
       const activeEl = document.activeElement as HTMLElement | null;
@@ -263,18 +265,13 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       }
 
       const dt = e.clipboardData;
-      if (!dt) {
-        inputControllerRef.current?.markLocalPasteHandled(false, 0);
-        return;
-      }
-
       const fileList: File[] = [];
-      if (dt.files && dt.files.length > 0) {
+      if (dt?.files && dt.files.length > 0) {
         for (let i = 0; i < dt.files.length; i++) {
           const f = dt.files[i];
           if (f) fileList.push(f);
         }
-      } else if (dt.items && dt.items.length > 0) {
+      } else if (dt?.items && dt.items.length > 0) {
         for (let i = 0; i < dt.items.length; i++) {
           const item = dt.items[i];
           if (item && item.kind === "file") {
@@ -297,7 +294,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         return;
       }
 
-      const pastedText = dt.getData("text/plain") ?? "";
+      const pastedText = dt?.getData("text/plain") ?? "";
       if (pastedText.length > 0 && allowClipboardRef.current) {
         if (pastedText === lastSyncedClipboardTextRef.current) {
           inputControllerRef.current?.markLocalPasteHandled(false, 0);
@@ -309,11 +306,46 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         return;
       }
 
+      // Fallback when browser DataTransfer hides native OS CF_HDROP files (e.g. .exe / .msi in WebView2 / strict Chrome)
+      if (allowFileTransferRef.current && nativeBridge.hasNativeOSControl()) {
+        inputControllerRef.current?.extendPasteWait(350);
+        void (async () => {
+          try {
+            const nativeEntries = await nativeBridge.getNativeClipboardFileEntries();
+            if (!mounted) return;
+            if (nativeEntries.length === 0) {
+              inputControllerRef.current?.markLocalPasteHandled(false, 0);
+              return;
+            }
+            inputControllerRef.current?.markLocalPasteHandled(true);
+            const loadedFiles: File[] = [];
+            for (const entry of nativeEntries) {
+              const f = await nativeBridge.readNativeClipboardFile(entry);
+              if (f) loadedFiles.push(f);
+            }
+            if (!mounted || loadedFiles.length === 0) return;
+            if (onSendFilesRef.current) {
+              onSendFilesRef.current(loadedFiles, { autoPaste: true });
+            } else {
+              for (const f of loadedFiles) {
+                onSendFileRef.current(f);
+              }
+            }
+          } catch {
+            if (mounted) {
+              inputControllerRef.current?.markLocalPasteHandled(false, 0);
+            }
+          }
+        })();
+        return;
+      }
+
       inputControllerRef.current?.markLocalPasteHandled(false, 0);
     };
 
     window.addEventListener("paste", handlePaste);
     return () => {
+      mounted = false;
       window.removeEventListener("paste", handlePaste);
     };
   }, [isHost]);

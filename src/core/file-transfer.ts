@@ -77,6 +77,7 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
 export interface FileSenderCallbacks {
   sendPacket: (packet: TransferChannelPacket) => boolean;
   getBufferedAmount: () => number;
+  isRelayTransport?: () => boolean;
   onProgress?: (progress: FileTransferProgress) => void;
   onComplete?: (transferId: string) => void;
   onError?: (transferId: string, error: string) => void;
@@ -126,6 +127,8 @@ export class FileSender {
 
     const startTime = performance.now();
     let transferredBytes = 0;
+    const usingRelay = this.callbacks.isRelayTransport?.() ?? false;
+    const maxBuffered = usingRelay ? 32 * 1024 : MAX_BUFFERED_AMOUNT;
 
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
       if (this.isCancelled) {
@@ -138,9 +141,13 @@ export class FileSender {
         throw new Error("Transfer cancelled");
       }
 
-      // Check backpressure
-      while (this.callbacks.getBufferedAmount() > MAX_BUFFERED_AMOUNT) {
+      // Check backpressure with timeout guard so stalled relay/DataChannel fails loudly
+      let waitCycles = 0;
+      while (this.callbacks.getBufferedAmount() > maxBuffered && !this.isCancelled) {
         await new Promise((resolve) => setTimeout(resolve, 20));
+        if (++waitCycles > 1500) {
+          throw new Error("Transfer timed out waiting for channel buffer to drain");
+        }
       }
 
       const start = chunkIndex * CHUNK_SIZE;
@@ -158,6 +165,11 @@ export class FileSender {
 
       if (!this.callbacks.sendPacket(chunkPacket)) {
         throw new Error(`Failed to transmit chunk ${chunkIndex}`);
+      }
+
+      // Smoothly pace Cloud WSS MQTT relay chunks so public brokers don't rate-limit multi-MB .exe/.msi apps
+      if (usingRelay && chunkIndex < totalChunks - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 8));
       }
 
       transferredBytes += chunkBuffer.byteLength;
@@ -205,12 +217,17 @@ export interface FileReceiverCallbacks {
   sendPacket?: (packet: TransferChannelPacket) => boolean;
 }
 
+interface ReceiveTransferState {
+  meta: FileMetadataPacket;
+  chunks: Map<number, Uint8Array>;
+  receivedBytes: number;
+  startTime: number;
+  finalizing?: boolean;
+}
+
 export class FileReceiver {
   private callbacks: FileReceiverCallbacks;
-  private currentMetadata: FileMetadataPacket | null = null;
-  private receivedChunks = new Map<number, Uint8Array>();
-  private receivedBytes = 0;
-  private startTime = 0;
+  private transfers = new Map<string, ReceiveTransferState>();
 
   constructor(callbacks: FileReceiverCallbacks) {
     this.callbacks = callbacks;
@@ -219,10 +236,12 @@ export class FileReceiver {
   public async handlePacket(packet: TransferChannelPacket): Promise<void> {
     switch (packet.kind) {
       case "file-metadata": {
-        this.currentMetadata = packet;
-        this.receivedChunks.clear();
-        this.receivedBytes = 0;
-        this.startTime = performance.now();
+        this.transfers.set(packet.transferId, {
+          meta: packet,
+          chunks: new Map<number, Uint8Array>(),
+          receivedBytes: 0,
+          startTime: performance.now(),
+        });
 
         this.callbacks.onProgress?.({
           transferId: packet.transferId,
@@ -240,44 +259,53 @@ export class FileReceiver {
       }
 
       case "file-chunk": {
-        if (!this.currentMetadata || this.currentMetadata.transferId !== packet.transferId) {
+        const state = this.transfers.get(packet.transferId);
+        if (!state || state.finalizing) {
+          return;
+        }
+        if (state.chunks.has(packet.chunkIndex)) {
           return;
         }
 
         const chunkBuf = base64ToArrayBuffer(packet.dataBase64);
         const chunkBytes = new Uint8Array(chunkBuf);
-        this.receivedChunks.set(packet.chunkIndex, chunkBytes);
-        this.receivedBytes += chunkBytes.byteLength;
+        state.chunks.set(packet.chunkIndex, chunkBytes);
+        state.receivedBytes += chunkBytes.byteLength;
 
-        const elapsedSec = (performance.now() - this.startTime) / 1000;
-        const speedMBps = elapsedSec > 0 ? this.receivedBytes / (1024 * 1024) / elapsedSec : 0;
-        const remainingBytes = this.currentMetadata.fileSize - this.receivedBytes;
+        const elapsedSec = (performance.now() - state.startTime) / 1000;
+        const speedMBps = elapsedSec > 0 ? state.receivedBytes / (1024 * 1024) / elapsedSec : 0;
+        const remainingBytes = Math.max(0, state.meta.fileSize - state.receivedBytes);
         const etaSeconds = speedMBps > 0 ? Math.round(remainingBytes / (speedMBps * 1024 * 1024)) : 0;
+        const progressPercent =
+          state.meta.fileSize > 0
+            ? Math.min(100, Math.round((state.receivedBytes / state.meta.fileSize) * 100))
+            : 100;
 
         this.callbacks.onProgress?.({
           transferId: packet.transferId,
-          fileName: this.currentMetadata.fileName,
-          fileSize: this.currentMetadata.fileSize,
-          transferredBytes: this.receivedBytes,
-          totalChunks: this.currentMetadata.totalChunks,
-          currentChunk: this.receivedChunks.size,
-          progressPercent: Math.round((this.receivedBytes / this.currentMetadata.fileSize) * 100),
+          fileName: state.meta.fileName,
+          fileSize: state.meta.fileSize,
+          transferredBytes: state.receivedBytes,
+          totalChunks: state.meta.totalChunks,
+          currentChunk: state.chunks.size,
+          progressPercent,
           speedMBps: Math.round(speedMBps * 10) / 10,
           etaSeconds,
           status: "transferring",
         });
 
         // Check if all chunks received
-        if (this.receivedChunks.size === this.currentMetadata.totalChunks) {
-          await this.finalizeFileTransfer();
+        if (state.chunks.size === state.meta.totalChunks) {
+          state.finalizing = true;
+          await this.finalizeFileTransfer(state);
         }
         break;
       }
 
       case "file-abort": {
-        if (this.currentMetadata?.transferId === packet.transferId) {
+        if (this.transfers.has(packet.transferId)) {
           this.callbacks.onError?.(packet.transferId, packet.reason);
-          this.reset();
+          this.transfers.delete(packet.transferId);
         }
         break;
       }
@@ -287,15 +315,13 @@ export class FileReceiver {
     }
   }
 
-  private async finalizeFileTransfer(): Promise<void> {
-    if (!this.currentMetadata) return;
-
-    const meta = this.currentMetadata;
+  private async finalizeFileTransfer(state: ReceiveTransferState): Promise<void> {
+    const { meta, chunks, receivedBytes } = state;
     this.callbacks.onProgress?.({
       transferId: meta.transferId,
       fileName: meta.fileName,
       fileSize: meta.fileSize,
-      transferredBytes: this.receivedBytes,
+      transferredBytes: receivedBytes,
       totalChunks: meta.totalChunks,
       currentChunk: meta.totalChunks,
       progressPercent: 100,
@@ -308,10 +334,10 @@ export class FileReceiver {
     const fullBuffer = new Uint8Array(meta.fileSize);
     let offset = 0;
     for (let i = 0; i < meta.totalChunks; i++) {
-      const chunk = this.receivedChunks.get(i);
+      const chunk = chunks.get(i);
       if (!chunk) {
         this.callbacks.onError?.(meta.transferId, `Missing chunk ${i}`);
-        this.reset();
+        this.transfers.delete(meta.transferId);
         return;
       }
       fullBuffer.set(chunk, offset);
@@ -331,7 +357,7 @@ export class FileReceiver {
         verified: false,
       };
       this.callbacks.sendPacket?.(completePacket);
-      this.reset();
+      this.transfers.delete(meta.transferId);
       return;
     }
 
@@ -364,13 +390,6 @@ export class FileReceiver {
       status: "completed",
     });
 
-    this.reset();
-  }
-
-  private reset(): void {
-    this.currentMetadata = null;
-    this.receivedChunks.clear();
-    this.receivedBytes = 0;
-    this.startTime = 0;
+    this.transfers.delete(meta.transferId);
   }
 }

@@ -6,12 +6,13 @@ import {
   CHUNK_SIZE,
 } from "../../src/core/file-transfer";
 import {
+  InputController,
   calculateNormalizedCoordinates,
 } from "../../src/core/input-controller";
 import { sha256 } from "../../src/core/crypto";
 import { NativeBridge } from "../../src/core/native-bridge";
 import { ACLGuard } from "../../src/core/acl-guard";
-import type { TransferChannelPacket } from "../../src/shared/protocol";
+import type { InputPacket, TransferChannelPacket } from "../../src/shared/protocol";
 
 describe("Phase 3: Input & File Transfer Quality Gate", () => {
   describe("1. Security Audit: Path Traversal Sanitization", () => {
@@ -355,6 +356,166 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       expect(
         guard.canExecuteTransferPacket({ kind: "clipboard-file-request", id: "1" })
       ).toBe(true);
+    });
+  });
+
+  describe("6. Stuck Modifier Recovery & Concurrent Multi-File Receiver", () => {
+    it("should release stale Alt/Ctrl modifiers before mouse clicks and emit release-all on blur", () => {
+      const originalWindow = (globalThis as Record<string, unknown>).window;
+      const originalDocument = (globalThis as Record<string, unknown>).document;
+
+      const makeTarget = () => {
+        const listeners = new Map<string, Set<(ev: unknown) => void>>();
+        return {
+          tabIndex: 0,
+          addEventListener: (type: string, fn: (ev: unknown) => void) => {
+            if (!listeners.has(type)) listeners.set(type, new Set());
+            listeners.get(type)!.add(fn);
+          },
+          removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+            listeners.get(type)?.delete(fn);
+          },
+          dispatch: (type: string, ev: Record<string, unknown>) => {
+            for (const fn of listeners.get(type) ?? []) {
+              fn(ev);
+            }
+          },
+          focus: () => {},
+          getBoundingClientRect: () => ({
+            left: 0,
+            top: 0,
+            width: 1000,
+            height: 500,
+            right: 1000,
+            bottom: 500,
+            x: 0,
+            y: 0,
+            toJSON: () => ({}),
+          }),
+        };
+      };
+
+      const winTarget = makeTarget();
+      const docTarget = {
+        ...makeTarget(),
+        activeElement: null as unknown,
+        visibilityState: "visible",
+      };
+      const container = makeTarget();
+      (globalThis as Record<string, unknown>).window = winTarget;
+      (globalThis as Record<string, unknown>).document = docTarget;
+
+      const emitted: InputPacket[] = [];
+      const controller = new InputController({
+        onInputPacket: (pkt) => emitted.push(pkt),
+      });
+
+      try {
+        controller.attach(container as unknown as HTMLElement, {
+          videoWidth: 1000,
+          videoHeight: 500,
+        } as HTMLVideoElement);
+
+        // Simulate Alt pressed (e.g. Alt+Tab) without corresponding keyup
+        container.dispatch("keydown", {
+          key: "Alt",
+          code: "AltLeft",
+          altKey: true,
+          ctrlKey: false,
+          shiftKey: false,
+          metaKey: false,
+          repeat: false,
+          preventDefault: () => {},
+        });
+
+        // Next click arrives with altKey=false: must release AltLeft BEFORE mouse-down
+        container.dispatch("mousedown", {
+          button: 0,
+          clientX: 500,
+          clientY: 250,
+          altKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          metaKey: false,
+          preventDefault: () => {},
+        });
+
+        const keyUpIdx = emitted.findIndex((p) => p.kind === "key-up" && p.code === "AltLeft");
+        const mouseDownIdx = emitted.findIndex((p) => p.kind === "mouse-down");
+        expect(keyUpIdx).toBeGreaterThan(-1);
+        expect(mouseDownIdx).toBeGreaterThan(keyUpIdx);
+
+        // Focus loss emits release-all
+        winTarget.dispatch("blur", {});
+        expect(emitted[emitted.length - 1]).toEqual({ kind: "release-all" });
+
+        // ACLGuard must always permit release-all even when allowInput=false
+        const guard = new ACLGuard({ allowInput: false });
+        expect(guard.canExecuteControlPacket({ kind: "release-all" })).toBe(true);
+      } finally {
+        controller.detach();
+        if (originalWindow === undefined) {
+          delete (globalThis as Record<string, unknown>).window;
+        } else {
+          (globalThis as Record<string, unknown>).window = originalWindow;
+        }
+        if (originalDocument === undefined) {
+          delete (globalThis as Record<string, unknown>).document;
+        } else {
+          (globalThis as Record<string, unknown>).document = originalDocument;
+        }
+      }
+    });
+
+    it("should receive concurrent multi-file chunks independently without clobbering earlier transfers", async () => {
+      const packetsA: TransferChannelPacket[] = [];
+      const packetsB: TransferChannelPacket[] = [];
+      const received: Array<{ name: string; bytes: Uint8Array; sha256: string }> = [];
+
+      const senderA = new FileSender({
+        sendPacket: (p) => {
+          packetsA.push(p);
+          return true;
+        },
+        getBufferedAmount: () => 0,
+      });
+      const senderB = new FileSender({
+        sendPacket: (p) => {
+          packetsB.push(p);
+          return true;
+        },
+        getBufferedAmount: () => 0,
+      });
+
+      const receiver = new FileReceiver({
+        sendPacket: () => true,
+        onFileReceived: (f) => {
+          void f.blob.arrayBuffer().then((buf) => {
+            received.push({ name: f.name, bytes: new Uint8Array(buf), sha256: f.sha256 });
+          });
+        },
+      });
+
+      const payloadA = new Uint8Array(CHUNK_SIZE + 512).fill(0x41);
+      const payloadB = new Uint8Array(CHUNK_SIZE + 256).fill(0x42);
+      await senderA.sendFile(new File([payloadA], "OmniDesk_1.0.0_x64.msi"));
+      await senderB.sendFile(new File([payloadB], "OmniDesk_portable_x64.exe"));
+
+      // Interleave metadata and chunk packets from both transfers
+      const maxLen = Math.max(packetsA.length, packetsB.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (packetsA[i]) await receiver.handlePacket(packetsA[i]!);
+        if (packetsB[i]) await receiver.handlePacket(packetsB[i]!);
+      }
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(received.length).toBe(2);
+      const msi = received.find((f) => f.name === "OmniDesk_1.0.0_x64.msi");
+      const exe = received.find((f) => f.name === "OmniDesk_portable_x64.exe");
+      expect(msi?.bytes.length).toBe(payloadA.length);
+      expect(exe?.bytes.length).toBe(payloadB.length);
+      expect(msi?.sha256).toBe(await sha256(payloadA));
+      expect(exe?.sha256).toBe(await sha256(payloadB));
     });
   });
 });

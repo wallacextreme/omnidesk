@@ -85,7 +85,13 @@ mod win_input {
         fn EmptyClipboard() -> i32;
         fn GetClipboardData(u_format: u32) -> *mut c_void;
         fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+        fn GetClipboardSequenceNumber() -> u32;
         fn MessageBoxW(hwnd: *const c_void, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragQueryFileW(hdrop: *mut c_void, i_file: u32, lpsz_file: *mut u16, cch: u32) -> u32;
     }
 
     pub fn show_error_box(title: &str, body: &str) {
@@ -246,7 +252,47 @@ mod win_input {
         res
     }
 
+    pub fn get_clipboard_sequence() -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    pub fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+        if !open_clipboard_with_retry() {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::new();
+        unsafe {
+            let handle = GetClipboardData(CF_HDROP);
+            if !handle.is_null() {
+                let total = DragQueryFileW(handle, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+                let limit = total.min(20);
+                for idx in 0..limit {
+                    let len = DragQueryFileW(handle, idx, std::ptr::null_mut(), 0);
+                    if len == 0 || len > 32767 {
+                        continue;
+                    }
+                    let mut buf: Vec<u16> = vec![0u16; (len as usize) + 1];
+                    let copied = DragQueryFileW(handle, idx, buf.as_mut_ptr(), len + 1);
+                    if copied > 0 {
+                        let s = String::from_utf16_lossy(&buf[..(copied as usize)]);
+                        if std::path::Path::new(&s).is_file() {
+                            paths.push(s);
+                        }
+                    }
+                }
+            }
+            let _ = CloseClipboard();
+        }
+        Ok(paths)
+    }
+
     pub fn trigger_ctrl_v() {
+        // Release stuck Alt / Shift / Win modifiers before synthesizing Ctrl+V
+        for vk in [0x12u16, 0xA4, 0xA5, 0x10, 0xA0, 0xA1, 0x5B, 0x5C] {
+            let ext = matches!(vk, 0xA5 | 0x5B | 0x5C);
+            send_vk(vk, ext, false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
         send_vk(0x11, false, true);  // VK_CONTROL down
         send_vk(0x56, false, true);  // V down
         send_vk(0x56, false, false); // V up
@@ -494,6 +540,10 @@ mod win_input {
 
     pub fn handle_key(packet: &serde_json::Value) {
         let kind = packet.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "release-all" {
+            release_all();
+            return;
+        }
         if kind == "special-key" {
             match packet.get("action").and_then(|v| v.as_str()).unwrap_or("") {
                 "esc" => {
@@ -636,6 +686,112 @@ pub mod commands {
         Ok(out)
     }
 
+    fn encode_base64(input: &[u8]) -> String {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+        let mut i = 0;
+        while i < input.len() {
+            let b0 = input[i] as u32;
+            let b1 = if i + 1 < input.len() { input[i + 1] as u32 } else { 0 };
+            let b2 = if i + 2 < input.len() { input[i + 2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+            out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+            out.push(if i + 1 < input.len() { TABLE[((triple >> 6) & 0x3F) as usize] as char } else { '=' });
+            out.push(if i + 2 < input.len() { TABLE[(triple & 0x3F) as usize] as char } else { '=' });
+            i += 3;
+        }
+        out
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct ClipboardFileEntry {
+        pub id: String,
+        pub name: String,
+        pub size: u64,
+    }
+
+    fn clipboard_allowlist() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>> {
+        static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>> =
+            std::sync::OnceLock::new();
+        MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[tauri::command]
+    pub fn get_clipboard_sequence() -> u32 {
+        #[cfg(target_os = "windows")]
+        {
+            return win_input::get_clipboard_sequence();
+        }
+        #[cfg(not(target_os = "windows"))]
+        0
+    }
+
+    #[tauri::command]
+    pub fn read_clipboard_files() -> Result<Vec<ClipboardFileEntry>, String> {
+        #[cfg(target_os = "windows")]
+        {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let paths = win_input::read_clipboard_file_paths()?;
+            let mut entries = Vec::new();
+            let mut next_map = std::collections::HashMap::new();
+            for raw_path in paths {
+                let pb = std::path::PathBuf::from(&raw_path);
+                let Ok(meta) = std::fs::metadata(&pb) else { continue; };
+                if !meta.is_file() || meta.len() > 157_286_400 {
+                    continue;
+                }
+                let name = pb
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "arquivo.bin".to_string());
+                let id = format!("tcf-{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                next_map.insert(id.clone(), pb);
+                entries.push(ClipboardFileEntry {
+                    id,
+                    name,
+                    size: meta.len(),
+                });
+            }
+            if let Ok(mut guard) = clipboard_allowlist().lock() {
+                *guard = next_map;
+            }
+            return Ok(entries);
+        }
+        #[cfg(not(target_os = "windows"))]
+        Ok(Vec::new())
+    }
+
+    #[tauri::command]
+    pub fn read_clipboard_file_chunk(id: String, offset: u64, length: u32) -> Result<String, String> {
+        let path = {
+            let guard = clipboard_allowlist()
+                .lock()
+                .map_err(|_| "Clipboard allowlist lock poisoned".to_string())?;
+            guard.get(&id).cloned()
+        }
+        .ok_or_else(|| "Arquivo da área de transferência expirado ou não autorizado".to_string())?;
+
+        use std::io::{Read, Seek, SeekFrom};
+        let capped_len = (length as usize).clamp(1, 2 * 1024 * 1024);
+        let mut f = std::fs::File::open(&path).map_err(|e| format!("Failed opening clipboard file: {e}"))?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed seeking clipboard file: {e}"))?;
+        let mut buf = vec![0u8; capped_len];
+        let mut total_read = 0usize;
+        while total_read < capped_len {
+            let n = f
+                .read(&mut buf[total_read..])
+                .map_err(|e| format!("Failed reading clipboard file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+        }
+        Ok(encode_base64(&buf[..total_read]))
+    }
+
     fn sanitize_filename(raw: &str) -> String {
         let base = raw.rsplit(['/', '\\']).next().unwrap_or("arquivo.bin");
         let cleaned: String = base
@@ -723,7 +879,7 @@ pub mod commands {
         {
             let _ = win_input::set_clipboard_file_drop(&final_str);
             if auto_paste.unwrap_or(false) {
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 win_input::trigger_ctrl_v();
             }
         }
@@ -747,6 +903,9 @@ pub fn run() {
             commands::release_all_inputs,
             commands::read_clipboard,
             commands::write_clipboard,
+            commands::get_clipboard_sequence,
+            commands::read_clipboard_files,
+            commands::read_clipboard_file_chunk,
             commands::save_received_file
         ])
         .run(tauri::generate_context!())

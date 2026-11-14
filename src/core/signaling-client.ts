@@ -31,6 +31,7 @@ export interface ConnectOptions {
 export interface ISignalingTransport {
   connect(options: ConnectOptions): void;
   send(message: SignalingMessage): void;
+  getBufferedAmount(): number;
   disconnect(): void;
   readonly isConnected: boolean;
 }
@@ -75,6 +76,7 @@ export class CloudWSSSignaling implements ISignalingTransport {
   private connected = false;
   private consecutiveFailures = 0;
   private failoverTimer: ReturnType<typeof setTimeout> | null = null;
+  private inflightPublishes = 0;
   private readonly textDecoder = new TextDecoder("utf-8");
 
   constructor(private handlers: SignalingClientHandlers) {}
@@ -251,16 +253,36 @@ export class CloudWSSSignaling implements ISignalingTransport {
     const isMediaFrame = message.type === "video-frame" || message.type === "video-frame-chunk";
     const qos: 0 | 1 = isMediaFrame ? 0 : 1;
 
+    if (qos === 1) {
+      this.inflightPublishes += 1;
+    }
+
     this.client.publish(targetTopic, payloadStr, { qos, retain: false }, (err) => {
+      if (qos === 1) {
+        this.inflightPublishes = Math.max(0, this.inflightPublishes - 1);
+      }
       if (err && !isMediaFrame) {
         console.warn(`[CloudWSS] Publish error to ${targetTopic}:`, err);
       }
     });
   }
 
+  public getBufferedAmount(): number {
+    if (!this.client || !this.connected) return 0;
+    const stream = (
+      this.client as unknown as {
+        stream?: { socket?: { bufferedAmount?: number }; writableLength?: number };
+      }
+    ).stream;
+    const socketBuf = stream?.socket?.bufferedAmount ?? 0;
+    const writableLen = stream?.writableLength ?? 0;
+    return Math.max(socketBuf, writableLen, this.inflightPublishes * 16384);
+  }
+
   public disconnect(): void {
     this.isDestroyed = true;
     this.connected = false;
+    this.inflightPublishes = 0;
     this.clearFailoverTimer();
     if (this.client) {
       try {
@@ -382,6 +404,10 @@ export class LocalSignalingClient implements ISignalingTransport {
     }
   }
 
+  public getBufferedAmount(): number {
+    return this.ws && this.ws.readyState === WebSocket.OPEN ? this.ws.bufferedAmount : 0;
+  }
+
   public disconnect(): void {
     this.isDestroyed = true;
     this.connected = false;
@@ -476,6 +502,10 @@ export class SignalingClient {
 
   public send(message: SignalingMessage): void {
     this.currentTransport?.send(message);
+  }
+
+  public getBufferedAmount(): number {
+    return this.currentTransport?.getBufferedAmount() ?? 0;
   }
 
   public disconnect(): void {

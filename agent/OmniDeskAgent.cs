@@ -217,11 +217,11 @@ namespace OmniDeskAgent
         private int _lastAbsX = -1;
         private int _lastAbsY = -1;
 
-        private void SendMouseMove(double x, double y)
+        private void SendMouseMove(double x, double y, bool force = false)
         {
             int absX = (int)Math.Round(x * 65535.0);
             int absY = (int)Math.Round(y * 65535.0);
-            if (absX == _lastAbsX && absY == _lastAbsY)
+            if (!force && absX == _lastAbsX && absY == _lastAbsY)
             {
                 return;
             }
@@ -238,6 +238,14 @@ namespace OmniDeskAgent
 
         public void TriggerCtrlV()
         {
+            ushort[] modsToRelease = new ushort[] { 0x12, 0xA4, 0xA5, 0x10, 0xA0, 0xA1, 0x5B, 0x5C };
+            for (int i = 0; i < modsToRelease.Length; i++)
+            {
+                ushort m = modsToRelease[i];
+                SendVk(m, IsExtendedVk(m), false);
+            }
+            Thread.Sleep(20);
+
             NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[4];
             inputs[0].type = NativeWin32.INPUT_KEYBOARD;
             inputs[0].U.ki.wVk = 0x11; // VK_CONTROL
@@ -258,7 +266,7 @@ namespace OmniDeskAgent
 
         private void SendMouseButton(double x, double y, string button, bool isDown)
         {
-            SendMouseMove(x, y);
+            SendMouseMove(x, y, true);
 
             uint flag;
             if (button == "right")
@@ -800,7 +808,7 @@ namespace OmniDeskAgent
                         isWsClient = true;
                         Interlocked.Increment(ref _activeClients);
                         NotifyStatus();
-                        SendWsText(conn, "{\"type\":\"hello\",\"platform\":\"windows\",\"port\":47831}");
+                        SendWsText(conn, "{\"type\":\"hello\",\"version\":2,\"caps\":[\"save-file-start\",\"clipboard-files\",\"release-all\"],\"platform\":\"windows\",\"port\":47831}");
 
                         try
                         {
@@ -981,6 +989,22 @@ namespace OmniDeskAgent
                 return;
             }
 
+            if (kind == "get-clipboard-files")
+            {
+                string itemsJson = "";
+                string sig = "";
+                RunOnStaSync(delegate
+                {
+                    try
+                    {
+                        BuildClipboardFilesSnapshot(out itemsJson, out sig);
+                    }
+                    catch { }
+                });
+                SendWsText(conn, "{\"kind\":\"clipboard-files-snapshot\",\"files\":[" + itemsJson + "]}");
+                return;
+            }
+
             if (kind == "request-clipboard-file")
             {
                 string fileId;
@@ -1156,7 +1180,7 @@ namespace OmniDeskAgent
 
             if (autoPaste)
             {
-                Thread.Sleep(60);
+                Thread.Sleep(100);
                 _executor.TriggerCtrlV();
             }
 
@@ -1226,6 +1250,55 @@ namespace OmniDeskAgent
             }
         }
 
+        private bool BuildClipboardFilesSnapshot(out string itemsJsonOut, out string signatureOut)
+        {
+            itemsJsonOut = "";
+            signatureOut = "";
+            if (!Clipboard.ContainsFileDropList()) return false;
+
+            StringCollection dropList = Clipboard.GetFileDropList();
+            if (dropList == null || dropList.Count == 0) return false;
+
+            List<string> sigParts = new List<string>();
+            StringBuilder itemsJson = new StringBuilder();
+            Dictionary<string, string> nextMap = new Dictionary<string, string>(StringComparer.Ordinal);
+            int count = 0;
+
+            foreach (string p in dropList)
+            {
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) continue;
+                FileInfo fi = new FileInfo(p);
+                string id = "cf-" + Interlocked.Increment(ref _clipFileSeq);
+                nextMap[id] = p;
+                sigParts.Add(p.ToLowerInvariant() + ":" + fi.Length + ":" + fi.LastWriteTimeUtc.Ticks);
+                if (count > 0) itemsJson.Append(',');
+                itemsJson.Append("{\"id\":\"").Append(EscapeJson(id))
+                         .Append("\",\"name\":\"").Append(EscapeJson(fi.Name))
+                         .Append("\",\"size\":").Append(fi.Length)
+                         .Append(",\"mimeType\":\"application/octet-stream\"}");
+                count++;
+                if (count >= 20) break;
+            }
+
+            if (count == 0) return false;
+
+            lock (_clipLock)
+            {
+                if (_clipboardFilePaths.Count > 80)
+                {
+                    _clipboardFilePaths.Clear();
+                }
+                foreach (KeyValuePair<string, string> kv in nextMap)
+                {
+                    _clipboardFilePaths[kv.Key] = kv.Value;
+                }
+            }
+
+            itemsJsonOut = itemsJson.ToString();
+            signatureOut = "F:" + string.Join("|", sigParts.ToArray());
+            return true;
+        }
+
         public void PollClipboard()
         {
             if (!_running || _activeClients <= 0) return;
@@ -1235,45 +1308,13 @@ namespace OmniDeskAgent
             {
                 if (Clipboard.ContainsFileDropList())
                 {
-                    StringCollection dropList = Clipboard.GetFileDropList();
-                    if (dropList == null || dropList.Count == 0) return;
-
-                    List<string> sigParts = new List<string>();
-                    StringBuilder itemsJson = new StringBuilder();
-                    Dictionary<string, string> nextMap = new Dictionary<string, string>(StringComparer.Ordinal);
-                    int count = 0;
-
-                    foreach (string p in dropList)
-                    {
-                        if (string.IsNullOrEmpty(p) || !File.Exists(p)) continue;
-                        FileInfo fi = new FileInfo(p);
-                        string id = "cf-" + Interlocked.Increment(ref _clipFileSeq);
-                        nextMap[id] = p;
-                        sigParts.Add(p.ToLowerInvariant() + ":" + fi.Length + ":" + fi.LastWriteTimeUtc.Ticks);
-                        if (count > 0) itemsJson.Append(',');
-                        itemsJson.Append("{\"id\":\"").Append(EscapeJson(id))
-                                 .Append("\",\"name\":\"").Append(EscapeJson(fi.Name))
-                                 .Append("\",\"size\":").Append(fi.Length)
-                                 .Append(",\"mimeType\":\"application/octet-stream\"}");
-                        count++;
-                        if (count >= 20) break;
-                    }
-
-                    if (count == 0) return;
-                    string sig = "F:" + string.Join("|", sigParts.ToArray());
+                    string itemsJson;
+                    string sig;
+                    if (!BuildClipboardFilesSnapshot(out itemsJson, out sig)) return;
                     if (sig == _lastClipboardSignature) return;
                     _lastClipboardSignature = sig;
 
-                    lock (_clipLock)
-                    {
-                        _clipboardFilePaths.Clear();
-                        foreach (KeyValuePair<string, string> kv in nextMap)
-                        {
-                            _clipboardFilePaths[kv.Key] = kv.Value;
-                        }
-                    }
-
-                    BroadcastJson("{\"kind\":\"clipboard-files\",\"files\":[" + itemsJson.ToString() + "]}");
+                    BroadcastJson("{\"kind\":\"clipboard-files\",\"files\":[" + itemsJson + "]}");
                 }
                 else if (Clipboard.ContainsText())
                 {

@@ -394,6 +394,11 @@ export const App: React.FC = () => {
         return;
       }
 
+      if (packet.kind === "release-all") {
+        void nativeBridge.releaseAllInputs();
+        return;
+      }
+
       if (
         packet.kind.startsWith("mouse-") ||
         packet.kind.startsWith("key-") ||
@@ -667,7 +672,11 @@ export const App: React.FC = () => {
       // File transfer handlers (WebRTC DataChannel with transparent WSS fallback)
       fileSenderRef.current = new FileSender({
         sendPacket: (pkt) => sendTransferPacketWithFallback(pkt),
-        getBufferedAmount: () => manager.getTransferBufferedAmount(),
+        getBufferedAmount: () =>
+          webrtcRef.current?.hasOpenTransferChannel()
+            ? manager.getTransferBufferedAmount()
+            : (signalingClientRef.current?.getBufferedAmount() ?? 0),
+        isRelayTransport: () => !(webrtcRef.current?.hasOpenTransferChannel() ?? false),
         onProgress: (prog) => setActiveTransferProgress({ ...prog }),
       });
 
@@ -680,7 +689,7 @@ export const App: React.FC = () => {
             ...prev,
           ]);
           void (async () => {
-            if (nativeBridge.getControlStatus() === "agent-connected") {
+            if (nativeBridge.hasNativeOSControl()) {
               try {
                 const buf = await file.blob.arrayBuffer();
                 const savedOk = await nativeBridge.saveReceivedFileToAgent(

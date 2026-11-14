@@ -46,6 +46,20 @@ export class NativeBridge implements INativeBridge {
   private idlePollTimer: ReturnType<typeof setInterval> | null = null;
   private focusHandler: (() => void) | null = null;
   private discoveryActive = false;
+  private agentCaps = new Set<string>();
+  private clipboardSnapshotWaiters: Array<
+    (files: Array<{ id: string; name: string; size: number; mimeType: string }>) => void
+  > = [];
+  private fileSavedWaiters = new Map<string, (saved: boolean) => void>();
+  private agentFileReadyWaiters = new Map<
+    string,
+    (file: { id: string; name: string; mimeType: string; size: number; data: ArrayBuffer }) => void
+  >();
+  private tauriClipboardFiles = new Map<string, { id: string; name: string; size: number }>();
+  private tauriClipboardPollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastTauriClipboardSeq: number | null = null;
+  private ignoreTauriClipboardSeq: number | null = null;
+  private lastTauriClipboardText = "";
 
   constructor() {
     if (this.isDesktopApp()) {
@@ -226,6 +240,8 @@ export class NativeBridge implements INativeBridge {
           this.probeInFlight = false;
           if (this.agentWs === ws) {
             this.agentWs = null;
+            this.agentCaps.clear();
+            this.flushPendingAgentWaiters();
           }
           this.setControlStatus(this.isDesktopApp() ? "tauri" : "browser-only");
         };
@@ -235,6 +251,8 @@ export class NativeBridge implements INativeBridge {
           this.probeInFlight = false;
           if (this.agentWs === ws) {
             this.agentWs = null;
+            this.agentCaps.clear();
+            this.flushPendingAgentWaiters();
           }
           this.setControlStatus(this.isDesktopApp() ? "tauri" : "browser-only");
           resolve(false);
@@ -566,9 +584,98 @@ export class NativeBridge implements INativeBridge {
     ) => void
   ): () => void {
     this.agentEventListeners.add(listener);
+    if (this.isDesktopApp() && this.agentEventListeners.size === 1) {
+      this.startTauriClipboardMonitor();
+    }
     return () => {
       this.agentEventListeners.delete(listener);
+      if (this.agentEventListeners.size === 0) {
+        this.stopTauriClipboardMonitor();
+      }
     };
+  }
+
+  private flushPendingAgentWaiters(): void {
+    const snapWaiters = this.clipboardSnapshotWaiters.splice(0, this.clipboardSnapshotWaiters.length);
+    for (const cb of snapWaiters) {
+      try {
+        cb([]);
+      } catch {}
+    }
+    for (const [, cb] of this.fileSavedWaiters) {
+      try {
+        cb(false);
+      } catch {}
+    }
+    this.fileSavedWaiters.clear();
+    this.agentFileReadyWaiters.clear();
+  }
+
+  private startTauriClipboardMonitor(): void {
+    if (this.tauriClipboardPollTimer || !this.isDesktopApp()) return;
+    let polling = false;
+    void (async () => {
+      try {
+        this.lastTauriClipboardSeq = await this.invokeTauri<number>("get_clipboard_sequence");
+      } catch {
+        this.lastTauriClipboardSeq = null;
+      }
+    })();
+
+    this.tauriClipboardPollTimer = setInterval(() => {
+      if (polling || this.agentEventListeners.size === 0) return;
+      // Avoid duplicate events if the external OmniDesk Agent WebSocket is also connected
+      if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) return;
+      polling = true;
+      void (async () => {
+        try {
+          const seq = await this.invokeTauri<number>("get_clipboard_sequence");
+          if (this.lastTauriClipboardSeq !== null && seq === this.lastTauriClipboardSeq) {
+            return;
+          }
+          this.lastTauriClipboardSeq = seq;
+          if (this.ignoreTauriClipboardSeq !== null && seq === this.ignoreTauriClipboardSeq) {
+            this.ignoreTauriClipboardSeq = null;
+            return;
+          }
+
+          const files = await this.invokeTauri<Array<{ id: string; name: string; size: number }>>(
+            "read_clipboard_files"
+          );
+          if (Array.isArray(files) && files.length > 0) {
+            this.tauriClipboardFiles.clear();
+            const normalized = files.map((f) => {
+              this.tauriClipboardFiles.set(f.id, f);
+              return {
+                id: f.id,
+                name: f.name,
+                size: f.size,
+                mimeType: "application/octet-stream",
+              };
+            });
+            this.emitAgentEvent({ kind: "clipboard-files", files: normalized });
+            return;
+          }
+
+          const text = await this.invokeTauri<string>("read_clipboard");
+          if (text && text !== this.lastTauriClipboardText) {
+            this.lastTauriClipboardText = text;
+            this.emitAgentEvent({ kind: "clipboard-text", text });
+          }
+        } catch {
+          // Clipboard temporarily busy or unavailable
+        } finally {
+          polling = false;
+        }
+      })();
+    }, 650);
+  }
+
+  private stopTauriClipboardMonitor(): void {
+    if (this.tauriClipboardPollTimer) {
+      clearInterval(this.tauriClipboardPollTimer);
+      this.tauriClipboardPollTimer = null;
+    }
   }
 
   private emitAgentEvent(
@@ -617,42 +724,74 @@ export class NativeBridge implements INativeBridge {
     return out;
   }
 
+  private parseAgentClipboardFiles(
+    rawList: unknown[]
+  ): Array<{ id: string; name: string; size: number; mimeType: string }> {
+    const files: Array<{ id: string; name: string; size: number; mimeType: string }> = [];
+    for (const item of rawList) {
+      if (item && typeof item === "object") {
+        const rec = item as Record<string, unknown>;
+        if (
+          typeof rec.id === "string" &&
+          typeof rec.name === "string" &&
+          typeof rec.size === "number"
+        ) {
+          files.push({
+            id: rec.id,
+            name: rec.name,
+            size: rec.size,
+            mimeType:
+              typeof rec.mimeType === "string" && rec.mimeType
+                ? rec.mimeType
+                : "application/octet-stream",
+          });
+        }
+      }
+    }
+    return files;
+  }
+
   private handleAgentWsMessage(raw: string): void {
     try {
       const msg = JSON.parse(raw) as Record<string, unknown>;
+      if (msg.type === "hello") {
+        this.agentCaps.clear();
+        if (Array.isArray(msg.caps)) {
+          for (const cap of msg.caps) {
+            if (typeof cap === "string") {
+              this.agentCaps.add(cap);
+            }
+          }
+        }
+        return;
+      }
+
       const kind = msg.kind;
       if (kind === "clipboard-text" && typeof msg.text === "string") {
         this.emitAgentEvent({ kind: "clipboard-text", text: msg.text });
         return;
       }
+      if (kind === "clipboard-files-snapshot" && Array.isArray(msg.files)) {
+        const files = this.parseAgentClipboardFiles(msg.files);
+        const waiter = this.clipboardSnapshotWaiters.shift();
+        waiter?.(files);
+        return;
+      }
       if (kind === "clipboard-files" && Array.isArray(msg.files)) {
-        const files: Array<{ id: string; name: string; size: number; mimeType: string }> = [];
-        for (const item of msg.files) {
-          if (item && typeof item === "object") {
-            const rec = item as Record<string, unknown>;
-            if (
-              typeof rec.id === "string" &&
-              typeof rec.name === "string" &&
-              typeof rec.size === "number"
-            ) {
-              files.push({
-                id: rec.id,
-                name: rec.name,
-                size: rec.size,
-                mimeType:
-                  typeof rec.mimeType === "string" && rec.mimeType
-                    ? rec.mimeType
-                    : "application/octet-stream",
-              });
-            }
-          }
-        }
+        const files = this.parseAgentClipboardFiles(msg.files);
         if (files.length > 0) {
           this.emitAgentEvent({ kind: "clipboard-files", files });
         }
         return;
       }
       if (kind === "file-saved" && typeof msg.name === "string" && typeof msg.path === "string") {
+        if (typeof msg.fileId === "string") {
+          const waiter = this.fileSavedWaiters.get(msg.fileId);
+          if (waiter) {
+            this.fileSavedWaiters.delete(msg.fileId);
+            waiter(true);
+          }
+        }
         this.emitAgentEvent({
           kind: "file-saved",
           path: msg.path,
@@ -712,21 +851,69 @@ export class NativeBridge implements INativeBridge {
           assembled.byteOffset,
           assembled.byteOffset + assembled.byteLength
         );
-        this.emitAgentEvent({
-          kind: "agent-clipboard-file-ready",
+        const readyPayload = {
+          kind: "agent-clipboard-file-ready" as const,
           id: entry.id,
           name: entry.name,
           mimeType: entry.mimeType,
           size: totalBytes,
           data: buffer,
-        });
+        };
+        const waiter = this.agentFileReadyWaiters.get(entry.id);
+        if (waiter) {
+          this.agentFileReadyWaiters.delete(entry.id);
+          waiter(readyPayload);
+        }
+        this.emitAgentEvent(readyPayload);
       }
     } catch {
       // Ignore malformed messages from local agent
     }
   }
 
+  private async readTauriClipboardFileBuffer(fileId: string, expectedSize: number): Promise<ArrayBuffer> {
+    const chunkLen = 1024 * 1024;
+    const total = Math.max(0, expectedSize);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    while (offset < total || (total === 0 && offset === 0)) {
+      const b64 = await this.invokeTauri<string>("read_clipboard_file_chunk", {
+        id: fileId,
+        offset,
+        length: chunkLen,
+      });
+      if (!b64) break;
+      const bytes = this.base64ToBytes(b64);
+      if (bytes.length === 0) break;
+      const copyLen = Math.min(bytes.length, out.length - offset);
+      out.set(bytes.subarray(0, copyLen), offset);
+      offset += copyLen;
+      if (total === 0 || bytes.length < chunkLen) break;
+    }
+    return out.buffer.slice(out.byteOffset, out.byteOffset + offset);
+  }
+
   public requestAgentClipboardFile(fileId: string): boolean {
+    if (this.isDesktopApp() && fileId.startsWith("tcf-")) {
+      const meta = this.tauriClipboardFiles.get(fileId);
+      if (!meta) return false;
+      void (async () => {
+        try {
+          const data = await this.readTauriClipboardFileBuffer(meta.id, meta.size);
+          this.emitAgentEvent({
+            kind: "agent-clipboard-file-ready",
+            id: meta.id,
+            name: meta.name,
+            mimeType: "application/octet-stream",
+            size: data.byteLength,
+            data,
+          });
+        } catch (err) {
+          console.warn("[NativeBridge] Tauri read_clipboard_file_chunk error:", err);
+        }
+      })();
+      return true;
+    }
     if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
       return false;
     }
@@ -736,6 +923,117 @@ export class NativeBridge implements INativeBridge {
     } catch {
       return false;
     }
+  }
+
+  public async getNativeClipboardFileEntries(): Promise<
+    Array<{ id: string; name: string; size: number; mimeType: string }>
+  > {
+    if (this.isDesktopApp()) {
+      try {
+        const files = await this.invokeTauri<Array<{ id: string; name: string; size: number }>>(
+          "read_clipboard_files"
+        );
+        if (Array.isArray(files) && files.length > 0) {
+          this.tauriClipboardFiles.clear();
+          return files.map((f) => {
+            this.tauriClipboardFiles.set(f.id, f);
+            return {
+              id: f.id,
+              name: f.name,
+              size: f.size,
+              mimeType: "application/octet-stream",
+            };
+          });
+        }
+      } catch {
+        // Fallback to agent WS if running
+      }
+    }
+
+    if (
+      this.agentWs &&
+      this.agentWs.readyState === WebSocket.OPEN &&
+      this.agentCaps.has("clipboard-files")
+    ) {
+      return new Promise((resolve) => {
+        let settled = false;
+        const done = (files: Array<{ id: string; name: string; size: number; mimeType: string }>) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(files);
+        };
+        const timer = setTimeout(() => {
+          const idx = this.clipboardSnapshotWaiters.indexOf(done);
+          if (idx >= 0) this.clipboardSnapshotWaiters.splice(idx, 1);
+          done([]);
+        }, 250);
+        this.clipboardSnapshotWaiters.push(done);
+        try {
+          this.agentWs?.send(JSON.stringify({ kind: "get-clipboard-files" }));
+        } catch {
+          const idx = this.clipboardSnapshotWaiters.indexOf(done);
+          if (idx >= 0) this.clipboardSnapshotWaiters.splice(idx, 1);
+          done([]);
+        }
+      });
+    }
+
+    return [];
+  }
+
+  public async readNativeClipboardFile(entry: {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+  }): Promise<File | null> {
+    if (this.isDesktopApp() && entry.id.startsWith("tcf-")) {
+      try {
+        const buf = await this.readTauriClipboardFileBuffer(entry.id, entry.size);
+        return new File([buf], entry.name, {
+          type: entry.mimeType || "application/octet-stream",
+        });
+      } catch {
+        return null;
+      }
+    }
+    if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+
+    return new Promise<File | null>((resolve) => {
+      let settled = false;
+      const finish = (file: File | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.agentFileReadyWaiters.delete(entry.id);
+        resolve(file);
+      };
+      const timer = setTimeout(() => finish(null), 15000);
+      this.agentFileReadyWaiters.set(entry.id, (ready) => {
+        finish(
+          new File([ready.data], ready.name, {
+            type: ready.mimeType || "application/octet-stream",
+          })
+        );
+      });
+      if (!this.requestAgentClipboardFile(entry.id)) {
+        finish(null);
+      }
+    });
+  }
+
+  public async readClipboardFiles(): Promise<File[]> {
+    const entries = await this.getNativeClipboardFileEntries();
+    if (entries.length === 0) return [];
+    const results: File[] = [];
+    for (const entry of entries) {
+      const f = await this.readNativeClipboardFile(entry);
+      if (f) results.push(f);
+    }
+    return results;
   }
 
   public async saveReceivedFileToAgent(
@@ -750,6 +1048,9 @@ export class NativeBridge implements INativeBridge {
           dataB64: this.bytesToBase64(new Uint8Array(data)),
           autoPaste,
         });
+        try {
+          this.ignoreTauriClipboardSeq = await this.invokeTauri<number>("get_clipboard_sequence");
+        } catch {}
         this.emitAgentEvent({
           kind: "file-saved",
           path: savedPath,
@@ -770,6 +1071,7 @@ export class NativeBridge implements INativeBridge {
       const chunkBytes = 64 * 1024;
       const totalChunks = Math.max(1, Math.ceil(bytes.length / chunkBytes));
       const fileId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const expectSavedAck = this.agentCaps.has("save-file-start");
 
       ws.send(
         JSON.stringify({
@@ -783,7 +1085,9 @@ export class NativeBridge implements INativeBridge {
       );
 
       for (let i = 0; i < totalChunks; i++) {
-        if (ws.readyState !== WebSocket.OPEN) return false;
+        if (ws.readyState !== WebSocket.OPEN) {
+          return false;
+        }
         const start = i * chunkBytes;
         const end = Math.min(start + chunkBytes, bytes.length);
         const slice = bytes.subarray(start, end);
@@ -800,9 +1104,25 @@ export class NativeBridge implements INativeBridge {
         }
       }
 
-      if (ws.readyState !== WebSocket.OPEN) return false;
+      if (ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+
+      const savedAckPromise = expectSavedAck
+        ? new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => {
+              this.fileSavedWaiters.delete(fileId);
+              resolve(false);
+            }, 6000);
+            this.fileSavedWaiters.set(fileId, (ok) => {
+              clearTimeout(timer);
+              resolve(ok);
+            });
+          })
+        : null;
+
       ws.send(JSON.stringify({ kind: "save-file-end", fileId }));
-      return true;
+      return savedAckPromise ? await savedAckPromise : true;
     } catch {
       return false;
     }
@@ -821,6 +1141,10 @@ export class NativeBridge implements INativeBridge {
     if (this.isDesktopApp()) {
       try {
         await this.invokeTauri("write_clipboard", { text });
+        this.lastTauriClipboardText = text;
+        try {
+          this.ignoreTauriClipboardSeq = await this.invokeTauri<number>("get_clipboard_sequence");
+        } catch {}
         return true;
       } catch {
         // fallback

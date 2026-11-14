@@ -253,10 +253,9 @@ export class WebRTCManager {
       this.pc = new RTCPeerConnection(getEffectiveRtcConfig());
       this.setupPeerConnectionEvents();
 
-      // Create Data Channels (ordered=false/maxRetransmits=0 for low-latency control)
+      // Reliable ordered DataChannel for control so key-up (Alt/Ctrl/Shift) and mouse-down/up never drop silently
       this.controlChannel = this.pc.createDataChannel("control-channel", {
-        ordered: false,
-        maxRetransmits: 0,
+        ordered: true,
       });
       this.setupControlChannel(this.controlChannel);
 
@@ -598,6 +597,10 @@ export class WebRTCManager {
 
   public getTransferBufferedAmount(): number {
     return this.transferChannel?.bufferedAmount ?? 0;
+  }
+
+  public hasOpenTransferChannel(): boolean {
+    return this.transferChannel?.readyState === "open";
   }
 
   public setTransferBufferedAmountLowThreshold(threshold: number): void {

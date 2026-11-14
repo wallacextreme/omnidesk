@@ -91,6 +91,75 @@ export class InputController {
   private pendingPasteRelease: (() => void) | null = null;
   private pendingModifierUps: Array<() => void> = [];
   private releasedKeyVDuringWait = false;
+  private heldModifiers = new Set<string>();
+
+  private static readonly MODIFIER_FLAGS: Record<
+    string,
+    { flag: "altKey" | "ctrlKey" | "shiftKey" | "metaKey"; key: string }
+  > = {
+    AltLeft: { flag: "altKey", key: "Alt" },
+    AltRight: { flag: "altKey", key: "Alt" },
+    ControlLeft: { flag: "ctrlKey", key: "Control" },
+    ControlRight: { flag: "ctrlKey", key: "Control" },
+    ShiftLeft: { flag: "shiftKey", key: "Shift" },
+    ShiftRight: { flag: "shiftKey", key: "Shift" },
+    MetaLeft: { flag: "metaKey", key: "Meta" },
+    MetaRight: { flag: "metaKey", key: "Meta" },
+  };
+
+  public extendPasteWait(delayMs: number): boolean {
+    if (this.pasteInterceptState !== "waiting") return false;
+    if (this.pendingPasteTimer !== null) {
+      window.clearTimeout(this.pendingPasteTimer);
+      this.pendingPasteTimer = null;
+    }
+    this.pendingPasteTimer = window.setTimeout(() => {
+      this.pendingPasteTimer = null;
+      this.dispatchPendingPasteKeys();
+    }, delayMs);
+    return true;
+  }
+
+  public releaseAllModifiers(emitReleaseAll = true): void {
+    if (this.pendingPasteTimer !== null) {
+      window.clearTimeout(this.pendingPasteTimer);
+      this.pendingPasteTimer = null;
+    }
+    this.pasteInterceptState = "idle";
+    this.pendingPasteDispatch = null;
+    this.pendingPasteRelease = null;
+    this.pendingModifierUps = [];
+    this.releasedKeyVDuringWait = false;
+    const hadHeld = this.heldModifiers.size > 0;
+    this.heldModifiers.clear();
+    if (emitReleaseAll || hadHeld) {
+      this.callbacks.onInputPacket({ kind: "release-all" });
+    }
+  }
+
+  private releaseStaleModifiers(
+    e: Pick<MouseEvent | KeyboardEvent, "altKey" | "ctrlKey" | "shiftKey" | "metaKey">,
+    excludeCode?: string
+  ): void {
+    if (this.heldModifiers.size === 0) return;
+    for (const code of Array.from(this.heldModifiers)) {
+      if (code === excludeCode) continue;
+      const info = InputController.MODIFIER_FLAGS[code];
+      if (!info) continue;
+      if (!e[info.flag]) {
+        this.heldModifiers.delete(code);
+        this.callbacks.onInputPacket({
+          kind: "key-up",
+          key: info.key,
+          code,
+          altKey: e.altKey,
+          ctrlKey: e.ctrlKey,
+          shiftKey: e.shiftKey,
+          metaKey: e.metaKey,
+        });
+      }
+    }
+  }
 
   public markLocalPasteHandled(suppressRemoteKeyV: boolean, releaseDelayMs = 0): void {
     if (this.pendingPasteTimer !== null) {
@@ -99,7 +168,7 @@ export class InputController {
     }
     if (this.pasteInterceptState !== "waiting") return;
     if (suppressRemoteKeyV) {
-      this.pasteInterceptState = "suppressed";
+      this.pasteInterceptState = this.releasedKeyVDuringWait ? "idle" : "suppressed";
       this.pendingPasteDispatch = null;
       this.pendingPasteRelease = null;
       this.releasedKeyVDuringWait = false;
@@ -164,9 +233,14 @@ export class InputController {
     container.addEventListener("contextmenu", this.handleContextMenu, { passive: false });
     container.addEventListener("keydown", this.handleKeyDown, { passive: false });
     container.addEventListener("keyup", this.handleKeyUp, { passive: false });
+    container.addEventListener("blur", this.handleFocusLoss);
+    window.addEventListener("blur", this.handleFocusLoss);
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
   }
 
   public detach(): void {
+    window.removeEventListener("blur", this.handleFocusLoss);
+    document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     if (!this.element) return;
     this.element.removeEventListener("mousemove", this.handleMouseMove);
     this.element.removeEventListener("mousedown", this.handleMouseDown);
@@ -175,10 +249,24 @@ export class InputController {
     this.element.removeEventListener("contextmenu", this.handleContextMenu);
     this.element.removeEventListener("keydown", this.handleKeyDown);
     this.element.removeEventListener("keyup", this.handleKeyUp);
+    this.element.removeEventListener("blur", this.handleFocusLoss);
+    this.releaseAllModifiers(this.heldModifiers.size > 0);
     this.element = null;
     this.videoElement = null;
     this.isAttached = false;
   }
+
+  private handleFocusLoss = (): void => {
+    if (!this.isAttached) return;
+    this.releaseAllModifiers(true);
+  };
+
+  private handleVisibilityChange = (): void => {
+    if (!this.isAttached) return;
+    if (document.visibilityState === "hidden") {
+      this.releaseAllModifiers(true);
+    }
+  };
 
   public sendSpecialKey(action: "ctrl-alt-del" | "lock" | "esc"): void {
     this.callbacks.onInputPacket({
@@ -212,6 +300,7 @@ export class InputController {
     const coords = this.getCoordinates(e);
     if (coords.outOfBounds) return;
 
+    this.releaseStaleModifiers(e);
     this.callbacks.onInputPacket({
       kind: "mouse-move",
       x: coords.x,
@@ -228,6 +317,7 @@ export class InputController {
     // Ignore clicks on letterboxed/pillarboxed black bars to prevent accidental clicks at (0, 0)
     if (coords.outOfBounds) return;
 
+    this.releaseStaleModifiers(e);
     const button = this.resolveButton(e.button);
     this.callbacks.onInputPacket({
       kind: "mouse-down",
@@ -242,6 +332,7 @@ export class InputController {
     const coords = this.getCoordinates(e);
     if (coords.outOfBounds) return;
 
+    this.releaseStaleModifiers(e);
     const button = this.resolveButton(e.button);
     this.callbacks.onInputPacket({
       kind: "mouse-up",
@@ -265,6 +356,11 @@ export class InputController {
   };
 
   private handleKeyDown = (e: KeyboardEvent): void => {
+    this.releaseStaleModifiers(e, e.code);
+    if (InputController.MODIFIER_FLAGS[e.code]) {
+      this.heldModifiers.add(e.code);
+    }
+
     const emitKeyDown = (): void => {
       this.callbacks.onInputPacket({
         kind: "key-down",
@@ -326,6 +422,7 @@ export class InputController {
   };
 
   private handleKeyUp = (e: KeyboardEvent): void => {
+    this.heldModifiers.delete(e.code);
     const emitKeyUp = (): void => {
       this.callbacks.onInputPacket({
         kind: "key-up",

@@ -119,6 +119,8 @@ export class ACLGuard {
       case "key-up":
       case "special-key":
         return true;
+      case "release-all":
+        return true;
       default: {
         const _exhaustive: never = packet;
         return false;
@@ -139,6 +141,7 @@ export class ACLGuard {
       case "key-up":
       case "special-key":
         return this.permissions.allowInput;
+      case "release-all":
       case "acl-update":
         return true;
       case "chat-message":

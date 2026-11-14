@@ -266,12 +266,18 @@ export const SpecialKeyPacketSchema = z.object({
   action: z.enum(["ctrl-alt-del", "lock", "esc"]),
 });
 
+export const ReleaseAllPacketSchema = z.object({
+  kind: z.literal("release-all"),
+});
+export type ReleaseAllPacket = z.infer<typeof ReleaseAllPacketSchema>;
+
 export const InputPacketSchema = z.discriminatedUnion("kind", [
   MouseMovePacketSchema,
   MouseButtonPacketSchema,
   MouseWheelPacketSchema,
   KeyPacketSchema,
   SpecialKeyPacketSchema,
+  ReleaseAllPacketSchema,
 ]);
 export type InputPacket = z.infer<typeof InputPacketSchema>;
 
@@ -314,6 +320,7 @@ export const ControlChannelPacketSchema = z.discriminatedUnion("kind", [
   MouseWheelPacketSchema,
   KeyPacketSchema,
   SpecialKeyPacketSchema,
+  ReleaseAllPacketSchema,
   ACLUpdatePacketSchema,
   ChatMessagePacketSchema,
   TelemetryPacketSchema,

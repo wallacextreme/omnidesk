@@ -140,6 +140,14 @@ namespace OmniDeskAgent
                     bool isDown = (kind == "mouse-down");
                     SendMouseButton(x, y, button, isDown);
                 }
+                else if (kind == "mouse-dblclick")
+                {
+                    double x = Clamp01(ParseDouble(pkt, "x", 0));
+                    double y = Clamp01(ParseDouble(pkt, "y", 0));
+                    string button;
+                    if (!pkt.TryGetValue("button", out button)) button = "left";
+                    SendMouseDblClick(x, y, button);
+                }
                 else if (kind == "mouse-wheel")
                 {
                     double dx = ParseDouble(pkt, "deltaX", 0);
@@ -217,10 +225,46 @@ namespace OmniDeskAgent
         private int _lastAbsX = -1;
         private int _lastAbsY = -1;
 
+        private static int ToAbsCoord(double normalized)
+        {
+            int val = (int)Math.Round(Clamp01(normalized) * 65535.0);
+            if (val < 0) return 0;
+            if (val > 65535) return 65535;
+            return val;
+        }
+
+        private static NativeWin32.INPUT MakeMouseAbsInput(int absX, int absY, uint flags)
+        {
+            NativeWin32.INPUT input = new NativeWin32.INPUT();
+            input.type = NativeWin32.INPUT_MOUSE;
+            input.U.mi.dx = absX;
+            input.U.mi.dy = absY;
+            input.U.mi.dwFlags = flags | NativeWin32.MOUSEEVENTF_ABSOLUTE;
+            return input;
+        }
+
+        private static void ResolveMouseButtonFlags(string button, out uint downFlag, out uint upFlag)
+        {
+            if (button == "right")
+            {
+                downFlag = NativeWin32.MOUSEEVENTF_RIGHTDOWN;
+                upFlag = NativeWin32.MOUSEEVENTF_RIGHTUP;
+                return;
+            }
+            if (button == "middle")
+            {
+                downFlag = NativeWin32.MOUSEEVENTF_MIDDLEDOWN;
+                upFlag = NativeWin32.MOUSEEVENTF_MIDDLEUP;
+                return;
+            }
+            downFlag = NativeWin32.MOUSEEVENTF_LEFTDOWN;
+            upFlag = NativeWin32.MOUSEEVENTF_LEFTUP;
+        }
+
         private void SendMouseMove(double x, double y, bool force = false)
         {
-            int absX = (int)Math.Round(x * 65535.0);
-            int absY = (int)Math.Round(y * 65535.0);
+            int absX = ToAbsCoord(x);
+            int absY = ToAbsCoord(y);
             if (!force && absX == _lastAbsX && absY == _lastAbsY)
             {
                 return;
@@ -229,10 +273,7 @@ namespace OmniDeskAgent
             _lastAbsY = absY;
 
             NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[1];
-            inputs[0].type = NativeWin32.INPUT_MOUSE;
-            inputs[0].U.mi.dx = absX;
-            inputs[0].U.mi.dy = absY;
-            inputs[0].U.mi.dwFlags = NativeWin32.MOUSEEVENTF_MOVE | NativeWin32.MOUSEEVENTF_ABSOLUTE;
+            inputs[0] = MakeMouseAbsInput(absX, absY, NativeWin32.MOUSEEVENTF_MOVE);
             NativeWin32.SendInput(1, inputs, NativeWin32.INPUT.Size);
         }
 
@@ -266,26 +307,40 @@ namespace OmniDeskAgent
 
         private void SendMouseButton(double x, double y, string button, bool isDown)
         {
-            SendMouseMove(x, y, true);
+            int absX = ToAbsCoord(x);
+            int absY = ToAbsCoord(y);
+            _lastAbsX = absX;
+            _lastAbsY = absY;
 
-            uint flag;
-            if (button == "right")
-            {
-                flag = isDown ? NativeWin32.MOUSEEVENTF_RIGHTDOWN : NativeWin32.MOUSEEVENTF_RIGHTUP;
-            }
-            else if (button == "middle")
-            {
-                flag = isDown ? NativeWin32.MOUSEEVENTF_MIDDLEDOWN : NativeWin32.MOUSEEVENTF_MIDDLEUP;
-            }
-            else
-            {
-                flag = isDown ? NativeWin32.MOUSEEVENTF_LEFTDOWN : NativeWin32.MOUSEEVENTF_LEFTUP;
-            }
+            uint downFlag;
+            uint upFlag;
+            ResolveMouseButtonFlags(button, out downFlag, out upFlag);
+            uint actionFlag = isDown ? downFlag : upFlag;
 
-            NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[1];
-            inputs[0].type = NativeWin32.INPUT_MOUSE;
-            inputs[0].U.mi.dwFlags = flag;
-            NativeWin32.SendInput(1, inputs, NativeWin32.INPUT.Size);
+            NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[2];
+            inputs[0] = MakeMouseAbsInput(absX, absY, NativeWin32.MOUSEEVENTF_MOVE);
+            inputs[1] = MakeMouseAbsInput(absX, absY, actionFlag);
+            NativeWin32.SendInput(2, inputs, NativeWin32.INPUT.Size);
+        }
+
+        private void SendMouseDblClick(double x, double y, string button)
+        {
+            int absX = ToAbsCoord(x);
+            int absY = ToAbsCoord(y);
+            _lastAbsX = absX;
+            _lastAbsY = absY;
+
+            uint downFlag;
+            uint upFlag;
+            ResolveMouseButtonFlags(button, out downFlag, out upFlag);
+
+            NativeWin32.INPUT[] inputs = new NativeWin32.INPUT[5];
+            inputs[0] = MakeMouseAbsInput(absX, absY, NativeWin32.MOUSEEVENTF_MOVE);
+            inputs[1] = MakeMouseAbsInput(absX, absY, downFlag);
+            inputs[2] = MakeMouseAbsInput(absX, absY, upFlag);
+            inputs[3] = MakeMouseAbsInput(absX, absY, downFlag);
+            inputs[4] = MakeMouseAbsInput(absX, absY, upFlag);
+            NativeWin32.SendInput(5, inputs, NativeWin32.INPUT.Size);
         }
 
         private static void SendMouseWheel(double deltaX, double deltaY)

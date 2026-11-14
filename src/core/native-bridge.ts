@@ -60,19 +60,31 @@ export class NativeBridge implements INativeBridge {
   private lastTauriClipboardSeq: number | null = null;
   private ignoreTauriClipboardSeq: number | null = null;
   private lastTauriClipboardText = "";
+  public nativeControlAvailable = false;
+  private isCapturingFrame = false;
+  private inFlightMouseMove = false;
+  private latestPendingMove: Extract<InputPacket, { kind: "mouse-move" }> | null = null;
 
   constructor() {
     if (this.isDesktopApp()) {
       this.agentStatus = "tauri";
+      this.nativeControlAvailable = true;
     }
   }
 
   public getControlStatus(): ControlBridgeStatus {
-    if (this.isDesktopApp()) return "tauri";
+    if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
+      return "tauri";
+    }
     return this.agentStatus;
   }
 
   public hasNativeOSControl(): boolean {
+    if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
+      return true;
+    }
     const status = this.getControlStatus();
     return status === "tauri" || status === "agent-connected";
   }
@@ -86,6 +98,7 @@ export class NativeBridge implements INativeBridge {
   }
 
   private setControlStatus(next: ControlBridgeStatus): void {
+    this.nativeControlAvailable = next === "tauri" || next === "agent-connected";
     if (this.agentStatus !== next) {
       this.agentStatus = next;
       for (const listener of this.statusListeners) {
@@ -109,7 +122,13 @@ export class NativeBridge implements INativeBridge {
   }
 
   public startAgentDiscovery(): void {
-    if (typeof window === "undefined" || this.isDesktopApp() || this.discoveryActive) return;
+    if (typeof window === "undefined") return;
+    if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
+      this.setControlStatus("tauri");
+      return;
+    }
+    if (this.discoveryActive) return;
     this.discoveryActive = true;
 
     const isWebDriver = Boolean((navigator as { webdriver?: boolean }).webdriver);
@@ -156,7 +175,12 @@ export class NativeBridge implements INativeBridge {
   }
 
   public startFastAgentPolling(durationMs = 60_000): void {
-    if (typeof window === "undefined" || this.isDesktopApp()) return;
+    if (typeof window === "undefined") return;
+    if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
+      this.setControlStatus("tauri");
+      return;
+    }
     if (this.fastPollTimer) {
       clearInterval(this.fastPollTimer);
     }
@@ -176,6 +200,7 @@ export class NativeBridge implements INativeBridge {
 
   public async probeAgentNow(): Promise<boolean> {
     if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
       this.setControlStatus("tauri");
       return true;
     }
@@ -332,7 +357,8 @@ export class NativeBridge implements INativeBridge {
     maxWidth = 1280,
     quality = 68
   ): Promise<{ dataUrl: string; width: number; height: number } | null> {
-    if (!this.isDesktopApp()) return null;
+    if (!this.isDesktopApp() || this.isCapturingFrame) return null;
+    this.isCapturingFrame = true;
     try {
       const res = await this.invokeTauri<{ data_url: string; width: number; height: number }>(
         "capture_screen_frame",
@@ -343,6 +369,8 @@ export class NativeBridge implements INativeBridge {
       }
     } catch (err) {
       console.warn("[NativeBridge] Tauri capture_screen_frame failed:", err);
+    } finally {
+      this.isCapturingFrame = false;
     }
     return null;
   }
@@ -351,7 +379,7 @@ export class NativeBridge implements INativeBridge {
     maxWidth = 960,
     quality = 0.58
   ): Promise<{ dataUrl: string; width: number; height: number } | null> {
-    if (this.isDesktopApp() && !this.forceSyntheticStream) {
+    if (this.isDesktopApp() && !this.forceSyntheticStream && !this.isCapturingFrame) {
       return await this.captureTauriScreenFrame(
         maxWidth,
         Math.round(Math.max(25, Math.min(95, quality * 100)))
@@ -552,8 +580,9 @@ export class NativeBridge implements INativeBridge {
     return synth;
   }
 
-  public async injectInput(packet: InputPacket): Promise<boolean> {
+  private async dispatchSingleInput(packet: InputPacket): Promise<boolean> {
     if (this.isDesktopApp()) {
+      this.nativeControlAvailable = true;
       try {
         if (packet.kind.startsWith("mouse-")) {
           await this.invokeTauri("inject_mouse_event", { packet });
@@ -564,10 +593,10 @@ export class NativeBridge implements INativeBridge {
         ) {
           await this.invokeTauri("inject_key_event", { packet });
         }
-        return true;
       } catch (err) {
         console.warn("[NativeBridge] Tauri native input injection error:", err);
       }
+      return true;
     }
 
     // Native OS Windows Agent over trusted loopback bridge (127.0.0.1:47831)
@@ -582,7 +611,12 @@ export class NativeBridge implements INativeBridge {
 
     // Browser-only DOM fallback (can interact only inside this browser tab)
     if (typeof document !== "undefined" && typeof window !== "undefined") {
-      if (packet.kind === "mouse-move" || packet.kind === "mouse-down" || packet.kind === "mouse-up") {
+      if (
+        packet.kind === "mouse-move" ||
+        packet.kind === "mouse-down" ||
+        packet.kind === "mouse-up" ||
+        packet.kind === "mouse-dblclick"
+      ) {
         const cx = packet.x * window.innerWidth;
         const cy = packet.y * window.innerHeight;
         const target =
@@ -590,9 +624,16 @@ export class NativeBridge implements INativeBridge {
           document.getElementById("remote-viewport-container") ??
           document.body;
 
-        const buttonCode = packet.kind === "mouse-move" ? 0 : packet.button === "right" ? 2 : packet.button === "middle" ? 1 : 0;
+        const buttonCode =
+          packet.kind === "mouse-move" ? 0 : packet.button === "right" ? 2 : packet.button === "middle" ? 1 : 0;
         const eventType =
-          packet.kind === "mouse-move" ? "mousemove" : packet.kind === "mouse-down" ? "mousedown" : "mouseup";
+          packet.kind === "mouse-move"
+            ? "mousemove"
+            : packet.kind === "mouse-down"
+              ? "mousedown"
+              : packet.kind === "mouse-dblclick"
+                ? "dblclick"
+                : "mouseup";
 
         target.dispatchEvent(
           new MouseEvent(eventType, {
@@ -636,14 +677,49 @@ export class NativeBridge implements INativeBridge {
     return true;
   }
 
+  public async injectInput(packet: InputPacket): Promise<boolean> {
+    if (
+      packet.kind === "mouse-down" ||
+      packet.kind === "mouse-up" ||
+      packet.kind === "mouse-dblclick"
+    ) {
+      // Discard any stale queued mouse-move so clicks execute immediately with zero lag
+      this.latestPendingMove = null;
+      return await this.dispatchSingleInput(packet);
+    }
+
+    if (packet.kind === "mouse-move") {
+      if (this.inFlightMouseMove) {
+        // Maximum mouse-move queue depth = 1 (keep only latest coordinate)
+        this.latestPendingMove = packet;
+        return true;
+      }
+      this.inFlightMouseMove = true;
+      try {
+        let current: Extract<InputPacket, { kind: "mouse-move" }> | null = packet;
+        while (current) {
+          await this.dispatchSingleInput(current);
+          current = this.latestPendingMove;
+          this.latestPendingMove = null;
+        }
+        return true;
+      } finally {
+        this.inFlightMouseMove = false;
+      }
+    }
+
+    return await this.dispatchSingleInput(packet);
+  }
+
   public async releaseAllInputs(): Promise<boolean> {
+    this.latestPendingMove = null;
     if (this.isDesktopApp()) {
       try {
         await this.invokeTauri("release_all_inputs");
-        return true;
       } catch (err) {
         console.warn("[NativeBridge] Tauri release_all_inputs error:", err);
       }
+      return true;
     }
     if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
       try {

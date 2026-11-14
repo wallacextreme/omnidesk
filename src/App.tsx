@@ -228,7 +228,9 @@ export const App: React.FC = () => {
   const fileSenderRef = useRef<FileSender | null>(null);
   const fileReceiverRef = useRef<FileReceiver | null>(null);
   const frameSeqRef = useRef<number>(0);
-  const lastWssMouseMoveRef = useRef<number>(0);
+  const latestMouseMoveRef = useRef<{ x: number; y: number } | null>(null);
+  const mouseMoveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastMouseMoveSentAtRef = useRef<number>(0);
   const frameChunkBufferRef = useRef<
     Map<
       string,
@@ -412,6 +414,13 @@ export const App: React.FC = () => {
         packet.kind.startsWith("key-") ||
         packet.kind === "special-key"
       ) {
+        if (
+          packet.kind === "mouse-down" ||
+          packet.kind === "mouse-up" ||
+          packet.kind === "mouse-dblclick"
+        ) {
+          frameRelayRef.current?.skipNextFrame();
+        }
         void nativeBridge.injectInput(packet as InputPacket);
       }
     } else {
@@ -549,15 +558,13 @@ export const App: React.FC = () => {
   const handleIncomingTransferPacketRef = useRef(handleIncomingTransferPacket);
   handleIncomingTransferPacketRef.current = handleIncomingTransferPacket;
 
-  const sendControlPacketWithFallback = useCallback(
+  const dispatchControlPacket = useCallback(
     (packet: ControlChannelPacket) => {
-      const sentViaWebRTC = webrtcRef.current?.sendControlPacket(packet) ?? false;
-      if (!sentViaWebRTC && remotePeerIdRef.current && deviceIdRef.current) {
-        if (packet.kind === "mouse-move") {
-          const now = Date.now();
-          if (now - lastWssMouseMoveRef.current < 80) return;
-          lastWssMouseMoveRef.current = now;
-        }
+      if (webrtcRef.current?.hasOpenControlChannel()) {
+        const sentViaWebRTC = webrtcRef.current.sendControlPacket(packet);
+        if (sentViaWebRTC) return;
+      }
+      if (remotePeerIdRef.current && deviceIdRef.current) {
         sendSignaling({
           type: "control-relay",
           targetId: remotePeerIdRef.current,
@@ -567,6 +574,63 @@ export const App: React.FC = () => {
       }
     },
     [sendSignaling]
+  );
+
+  const clearPendingMouseMove = useCallback(() => {
+    if (mouseMoveTimerRef.current !== null) {
+      clearTimeout(mouseMoveTimerRef.current);
+      mouseMoveTimerRef.current = null;
+    }
+    latestMouseMoveRef.current = null;
+  }, []);
+
+  const sendControlPacketWithFallback = useCallback(
+    (packet: ControlChannelPacket) => {
+      if (
+        packet.kind === "mouse-down" ||
+        packet.kind === "mouse-up" ||
+        packet.kind === "mouse-dblclick" ||
+        packet.kind === "key-down" ||
+        packet.kind === "key-up"
+      ) {
+        clearPendingMouseMove();
+        dispatchControlPacket(packet);
+        return;
+      }
+
+      if (packet.kind === "mouse-move") {
+        const isWebRtcOpen = webrtcRef.current?.hasOpenControlChannel() ?? false;
+        const intervalMs = isWebRtcOpen ? 16 : 40;
+        const now = Date.now();
+        const elapsed = now - lastMouseMoveSentAtRef.current;
+
+        if (elapsed >= intervalMs) {
+          clearPendingMouseMove();
+          lastMouseMoveSentAtRef.current = now;
+          dispatchControlPacket(packet);
+        } else {
+          latestMouseMoveRef.current = { x: packet.x, y: packet.y };
+          if (mouseMoveTimerRef.current === null) {
+            mouseMoveTimerRef.current = setTimeout(() => {
+              mouseMoveTimerRef.current = null;
+              const pending = latestMouseMoveRef.current;
+              latestMouseMoveRef.current = null;
+              if (!pending) return;
+              lastMouseMoveSentAtRef.current = Date.now();
+              dispatchControlPacket({
+                kind: "mouse-move",
+                x: pending.x,
+                y: pending.y,
+              });
+            }, Math.max(1, intervalMs - elapsed));
+          }
+        }
+        return;
+      }
+
+      dispatchControlPacket(packet);
+    },
+    [clearPendingMouseMove, dispatchControlPacket]
   );
 
   // Instant WSS Frame Relay (AnyDesk fallback, auto-chunked for public MQTT reliability)
@@ -676,6 +740,13 @@ export const App: React.FC = () => {
             }
           } else if (state === "disconnected" && role === "host") {
             frameRelayRef.current?.resume();
+          } else if (state === "connected" && role === "host" && !clientReportedWebRtcFreezeRef.current) {
+            frameRelayRef.current?.pause();
+          }
+        },
+        onControlChannelStateChange: (open) => {
+          if (open && role === "host" && !clientReportedWebRtcFreezeRef.current) {
+            frameRelayRef.current?.pause();
           }
         },
         onControlPacket: (packet) => {
@@ -1404,6 +1475,8 @@ export const App: React.FC = () => {
 
       frameRelayRef.current?.stop();
       frameRelayRef.current = null;
+      clearPendingMouseMove();
+      lastMouseMoveSentAtRef.current = 0;
       if (hostStreamRef.current) {
         for (const track of hostStreamRef.current.getTracks()) {
           try {
@@ -1451,7 +1524,7 @@ export const App: React.FC = () => {
       lastSyncedClipboardTextRef.current = "";
       hostClipboardFilesMapRef.current.clear();
     },
-    [sendSignaling]
+    [sendSignaling, clearPendingMouseMove]
   );
 
   handleEndSessionRef.current = handleEndSession;

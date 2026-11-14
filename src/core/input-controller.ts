@@ -84,7 +84,16 @@ export class InputController {
   private callbacks: InputControllerCallbacks;
   private isAttached = false;
   private lastMoveTime = 0;
-  private readonly THROTTLE_MS = 8; // ~125Hz smooth mouse tracking without queue lag
+  private readonly THROTTLE_MS = 16; // ~60Hz coalesced mouse tracking without queue lag
+  private latestPendingMove: { x: number; y: number } | null = null;
+  private moveFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastLeftDownTime = 0;
+  private lastLeftDownClientX = 0;
+  private lastLeftDownClientY = 0;
+  private lastLeftDownNormX = 0;
+  private lastLeftDownNormY = 0;
+  private suppressedDblClickUp = false;
+  private lastAtomicDblClickTime = 0;
   private pasteInterceptState: "idle" | "waiting" | "suppressed" = "idle";
   private pendingPasteTimer: number | null = null;
   private pendingPasteDispatch: (() => void) | null = null;
@@ -229,6 +238,7 @@ export class InputController {
     container.addEventListener("mousemove", this.handleMouseMove, { passive: false });
     container.addEventListener("mousedown", this.handleMouseDown, { passive: false });
     container.addEventListener("mouseup", this.handleMouseUp, { passive: false });
+    container.addEventListener("dblclick", this.handleDoubleClick, { passive: false });
     container.addEventListener("wheel", this.handleWheel, { passive: false });
     container.addEventListener("contextmenu", this.handleContextMenu, { passive: false });
     container.addEventListener("keydown", this.handleKeyDown, { passive: false });
@@ -239,12 +249,14 @@ export class InputController {
   }
 
   public detach(): void {
+    this.clearPendingMouseMove();
     window.removeEventListener("blur", this.handleFocusLoss);
     document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     if (!this.element) return;
     this.element.removeEventListener("mousemove", this.handleMouseMove);
     this.element.removeEventListener("mousedown", this.handleMouseDown);
     this.element.removeEventListener("mouseup", this.handleMouseUp);
+    this.element.removeEventListener("dblclick", this.handleDoubleClick);
     this.element.removeEventListener("wheel", this.handleWheel);
     this.element.removeEventListener("contextmenu", this.handleContextMenu);
     this.element.removeEventListener("keydown", this.handleKeyDown);
@@ -254,6 +266,14 @@ export class InputController {
     this.element = null;
     this.videoElement = null;
     this.isAttached = false;
+  }
+
+  public clearPendingMouseMove(): void {
+    if (this.moveFlushTimer !== null) {
+      globalThis.clearTimeout(this.moveFlushTimer);
+      this.moveFlushTimer = null;
+    }
+    this.latestPendingMove = null;
   }
 
   private handleFocusLoss = (): void => {
@@ -291,14 +311,34 @@ export class InputController {
 
   private handleMouseMove = (e: MouseEvent): void => {
     e.preventDefault();
-    const now = performance.now();
-    if (now - this.lastMoveTime < this.THROTTLE_MS) {
-      return;
-    }
-    this.lastMoveTime = now;
-
     const coords = this.getCoordinates(e);
     if (coords.outOfBounds) return;
+
+    const now = performance.now();
+    const elapsed = now - this.lastMoveTime;
+    if (elapsed < this.THROTTLE_MS) {
+      // Coalesce intermediate moves: keep only the latest coordinate
+      this.latestPendingMove = { x: coords.x, y: coords.y };
+      if (this.moveFlushTimer === null) {
+        const delay = Math.max(1, Math.ceil(this.THROTTLE_MS - elapsed));
+        this.moveFlushTimer = globalThis.setTimeout(() => {
+          this.moveFlushTimer = null;
+          const pending = this.latestPendingMove;
+          this.latestPendingMove = null;
+          if (!pending || !this.isAttached) return;
+          this.lastMoveTime = performance.now();
+          this.callbacks.onInputPacket({
+            kind: "mouse-move",
+            x: pending.x,
+            y: pending.y,
+          });
+        }, delay);
+      }
+      return;
+    }
+
+    this.clearPendingMouseMove();
+    this.lastMoveTime = now;
 
     this.releaseStaleModifiers(e);
     this.callbacks.onInputPacket({
@@ -317,8 +357,41 @@ export class InputController {
     // Ignore clicks on letterboxed/pillarboxed black bars to prevent accidental clicks at (0, 0)
     if (coords.outOfBounds) return;
 
+    this.clearPendingMouseMove();
     this.releaseStaleModifiers(e);
     const button = this.resolveButton(e.button);
+    const now = performance.now();
+
+    if (
+      button === "left" &&
+      this.lastLeftDownTime > 0 &&
+      now - this.lastLeftDownTime <= 350 &&
+      Math.hypot(e.clientX - this.lastLeftDownClientX, e.clientY - this.lastLeftDownClientY) < 6
+    ) {
+      this.suppressedDblClickUp = true;
+      this.lastLeftDownTime = 0;
+      this.lastAtomicDblClickTime = now;
+      this.callbacks.onInputPacket({
+        kind: "mouse-dblclick",
+        button: "left",
+        x: this.lastLeftDownNormX,
+        y: this.lastLeftDownNormY,
+      });
+      return;
+    }
+
+    if (button === "left") {
+      this.suppressedDblClickUp = false;
+      this.lastLeftDownTime = now;
+      this.lastLeftDownClientX = e.clientX;
+      this.lastLeftDownClientY = e.clientY;
+      this.lastLeftDownNormX = coords.x;
+      this.lastLeftDownNormY = coords.y;
+    } else {
+      this.suppressedDblClickUp = false;
+      this.lastLeftDownTime = 0;
+    }
+
     this.callbacks.onInputPacket({
       kind: "mouse-down",
       button,
@@ -332,11 +405,39 @@ export class InputController {
     const coords = this.getCoordinates(e);
     if (coords.outOfBounds) return;
 
+    this.clearPendingMouseMove();
     this.releaseStaleModifiers(e);
     const button = this.resolveButton(e.button);
+    if (this.suppressedDblClickUp && button === "left") {
+      this.suppressedDblClickUp = false;
+      return;
+    }
+
     this.callbacks.onInputPacket({
       kind: "mouse-up",
       button,
+      x: coords.x,
+      y: coords.y,
+    });
+  };
+
+  private handleDoubleClick = (e: MouseEvent): void => {
+    e.preventDefault();
+    const coords = this.getCoordinates(e);
+    if (coords.outOfBounds) return;
+
+    this.clearPendingMouseMove();
+    const now = performance.now();
+    if (this.lastAtomicDblClickTime > 0 && now - this.lastAtomicDblClickTime < 500) {
+      return;
+    }
+    this.lastAtomicDblClickTime = now;
+    this.lastLeftDownTime = 0;
+    this.suppressedDblClickUp = false;
+    this.releaseStaleModifiers(e);
+    this.callbacks.onInputPacket({
+      kind: "mouse-dblclick",
+      button: "left",
       x: coords.x,
       y: coords.y,
     });

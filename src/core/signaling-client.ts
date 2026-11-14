@@ -251,7 +251,8 @@ export class CloudWSSSignaling implements ISignalingTransport {
     const targetTopic = `omnidesk/v1/peer/${targetId}`;
     const payloadStr = JSON.stringify(message);
     const isMediaFrame = message.type === "video-frame" || message.type === "video-frame-chunk";
-    const qos: 0 | 1 = isMediaFrame ? 0 : 1;
+    const isLowLatency = isMediaFrame || message.type === "control-relay";
+    const qos: 0 | 1 = isLowLatency ? 0 : 1;
 
     if (qos === 1) {
       this.inflightPublishes += 1;

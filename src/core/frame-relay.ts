@@ -11,6 +11,8 @@ export class FrameRelayHost {
   private timer: ReturnType<typeof setInterval> | null = null;
   private isRunning = false;
   private isPaused = false;
+  private isCapturingFrame = false;
+  private skipNextCycle = false;
   private maxWidth = 1280;
   private intervalMs = 200;
   private adaptiveQuality = 0.78;
@@ -101,6 +103,10 @@ export class FrameRelayHost {
     return this.isPaused;
   }
 
+  public skipNextFrame(): void {
+    this.skipNextCycle = true;
+  }
+
   public updateStream(newStream: MediaStream): void {
     this.stream = newStream;
     this.lastFrameDataUrl = "";
@@ -125,43 +131,57 @@ export class FrameRelayHost {
     if (!this.isRunning || (this.isPaused && !force) || !this.video || !this.canvas || !this.ctx) {
       return;
     }
-    if (this.video.readyState < 2 || this.video.videoWidth === 0) return;
-
-    const vW = this.video.videoWidth;
-    const vH = this.video.videoHeight;
-    const scale = Math.min(1, this.maxWidth / vW);
-    const targetW = Math.max(2, Math.round(vW * scale));
-    const targetH = Math.max(2, Math.round(vH * scale));
-
-    if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
-      this.canvas.width = targetW;
-      this.canvas.height = targetH;
-    }
-
-    this.ctx.drawImage(this.video, 0, 0, targetW, targetH);
-
-    let dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
-    if (dataUrl.length > 90_000 && this.adaptiveQuality > 0.42) {
-      this.adaptiveQuality = Math.max(0.42, this.adaptiveQuality - 0.1);
-      dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
-    } else if (dataUrl.length < 48_000 && this.adaptiveQuality < 0.78) {
-      this.adaptiveQuality = Math.min(0.78, this.adaptiveQuality + 0.04);
-    }
-
-    const now = Date.now();
-    // Skip duplicate static desktop frames for up to 2s to preserve WSS broker bandwidth
-    if (!force && dataUrl === this.lastFrameDataUrl && now - this.lastSentAt < 2000) {
+    if (this.isCapturingFrame) {
       return;
     }
+    if (!force && this.skipNextCycle) {
+      this.skipNextCycle = false;
+      return;
+    }
+    if (this.video.readyState < 2 || this.video.videoWidth === 0) return;
 
-    this.lastFrameDataUrl = dataUrl;
-    this.lastSentAt = now;
-    this.onFrame(dataUrl, targetW, targetH);
+    this.isCapturingFrame = true;
+    try {
+      const vW = this.video.videoWidth;
+      const vH = this.video.videoHeight;
+      const scale = Math.min(1, this.maxWidth / vW);
+      const targetW = Math.max(2, Math.round(vW * scale));
+      const targetH = Math.max(2, Math.round(vH * scale));
+
+      if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
+        this.canvas.width = targetW;
+        this.canvas.height = targetH;
+      }
+
+      this.ctx.drawImage(this.video, 0, 0, targetW, targetH);
+
+      let dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
+      if (dataUrl.length > 90_000 && this.adaptiveQuality > 0.42) {
+        this.adaptiveQuality = Math.max(0.42, this.adaptiveQuality - 0.1);
+        dataUrl = this.encodeCanvas(this.canvas, this.adaptiveQuality);
+      } else if (dataUrl.length < 48_000 && this.adaptiveQuality < 0.78) {
+        this.adaptiveQuality = Math.min(0.78, this.adaptiveQuality + 0.04);
+      }
+
+      const now = Date.now();
+      // Skip duplicate static desktop frames for up to 2s to preserve WSS broker bandwidth
+      if (!force && dataUrl === this.lastFrameDataUrl && now - this.lastSentAt < 2000) {
+        return;
+      }
+
+      this.lastFrameDataUrl = dataUrl;
+      this.lastSentAt = now;
+      this.onFrame(dataUrl, targetW, targetH);
+    } finally {
+      this.isCapturingFrame = false;
+    }
   }
 
   public stop(): void {
     this.isRunning = false;
     this.isPaused = false;
+    this.isCapturingFrame = false;
+    this.skipNextCycle = false;
     this.lastFrameDataUrl = "";
     if (this.timer) {
       clearInterval(this.timer);

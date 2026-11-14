@@ -114,6 +114,7 @@ export class ACLGuard {
       case "mouse-move":
       case "mouse-down":
       case "mouse-up":
+      case "mouse-dblclick":
       case "mouse-wheel":
       case "key-down":
       case "key-up":
@@ -136,6 +137,7 @@ export class ACLGuard {
       case "mouse-move":
       case "mouse-down":
       case "mouse-up":
+      case "mouse-dblclick":
       case "mouse-wheel":
       case "key-down":
       case "key-up":

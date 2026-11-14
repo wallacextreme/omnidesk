@@ -239,7 +239,7 @@ export const MouseMovePacketSchema = z.object({
 });
 
 export const MouseButtonPacketSchema = z.object({
-  kind: z.enum(["mouse-down", "mouse-up"]),
+  kind: z.enum(["mouse-down", "mouse-up", "mouse-dblclick"]),
   button: z.enum(["left", "right", "middle"]),
   x: z.number().min(0).max(1),
   y: z.number().min(0).max(1),

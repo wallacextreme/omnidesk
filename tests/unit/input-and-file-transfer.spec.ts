@@ -518,4 +518,237 @@ describe("Phase 3: Input & File Transfer Quality Gate", () => {
       expect(exe?.sha256).toBe(await sha256(payloadB));
     });
   });
+
+  describe("7. Ultra-Low Latency Input: mouse-dblclick, Move Coalescing & Tauri Bypass", () => {
+    it("accepts mouse-dblclick in InputPacketSchema and ACLGuard", async () => {
+      const { InputPacketSchema } = await import("../../src/shared/protocol");
+      const { ACLGuard } = await import("../../src/core/acl-guard");
+
+      const pkt = { kind: "mouse-dblclick" as const, x: 0.42, y: 0.68, button: "left" as const };
+      const parsed = InputPacketSchema.safeParse(pkt);
+      expect(parsed.success).toBe(true);
+
+      const guardAllow = new ACLGuard({ allowInput: true });
+      expect(guardAllow.canExecuteInput(pkt)).toBe(true);
+
+      const guardDeny = new ACLGuard({ allowInput: false });
+      expect(guardDeny.canExecuteInput(pkt)).toBe(false);
+    });
+
+    it("InputController coalesces 100 rapid mouse-move events, discards pending moves on click (<10ms), and emits atomic mouse-dblclick", async () => {
+      const { InputController } = await import("../../src/core/input-controller");
+
+      const originalWindow = (globalThis as Record<string, unknown>).window;
+      const originalDocument = (globalThis as Record<string, unknown>).document;
+      type Listener = (ev: Record<string, unknown>) => void;
+      const winListeners = new Map<string, Listener[]>();
+      const elListeners = new Map<string, Listener[]>();
+
+      (globalThis as Record<string, unknown>).window = {
+        setTimeout: globalThis.setTimeout.bind(globalThis),
+        clearTimeout: globalThis.clearTimeout.bind(globalThis),
+        addEventListener: (type: string, cb: Listener) => {
+          const list = winListeners.get(type) ?? [];
+          list.push(cb);
+          winListeners.set(type, list);
+        },
+        removeEventListener: (type: string, cb: Listener) => {
+          const list = winListeners.get(type) ?? [];
+          winListeners.set(type, list.filter((x) => x !== cb));
+        },
+        dispatchEvent: (ev: { type: string }) => {
+          for (const cb of winListeners.get(ev.type) ?? []) cb(ev);
+          return true;
+        },
+      };
+
+      const element = {
+        focus: () => {},
+        addEventListener: (type: string, cb: Listener) => {
+          const list = elListeners.get(type) ?? [];
+          list.push(cb);
+          elListeners.set(type, list);
+        },
+        removeEventListener: (type: string, cb: Listener) => {
+          const list = elListeners.get(type) ?? [];
+          elListeners.set(type, list.filter((x) => x !== cb));
+        },
+        dispatchEvent: (type: string, payload: Record<string, unknown>) => {
+          const ev = {
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            ...payload,
+            type,
+          };
+          for (const cb of elListeners.get(type) ?? []) cb(ev);
+        },
+        getBoundingClientRect: () => ({
+          left: 0,
+          top: 0,
+          width: 1000,
+          height: 1000,
+          right: 1000,
+          bottom: 1000,
+        }),
+      };
+
+      (globalThis as Record<string, unknown>).document = {
+        visibilityState: "visible",
+        activeElement: element,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      };
+
+      const mockVideo = {
+        videoWidth: 1000,
+        videoHeight: 1000,
+      } as unknown as HTMLVideoElement;
+
+      try {
+        const emitted: Array<{ kind: string; x?: number; y?: number; button?: string }> = [];
+        const controller = new InputController({
+          onInputPacket: (pkt) => {
+            emitted.push(pkt as { kind: string; x?: number; y?: number; button?: string });
+          },
+        });
+        controller.attach(element as unknown as HTMLElement, mockVideo);
+
+        // 100 rapid mousemove events within the same 1ms frame
+        for (let i = 0; i < 100; i++) {
+          element.dispatchEvent("mousemove", { clientX: i * 5, clientY: i * 3 });
+        }
+        const movesBeforeClick = emitted.filter((p) => p.kind === "mouse-move").length;
+        expect(movesBeforeClick).toBeLessThanOrEqual(2);
+
+        const clickStart = performance.now();
+        element.dispatchEvent("mousedown", { clientX: 500, clientY: 400, button: 0 });
+        const clickElapsedMs = performance.now() - clickStart;
+        expect(clickElapsedMs).toBeLessThan(10);
+
+        // Wait past THROTTLE_MS (16ms) to verify pending stale mousemove was discarded on click
+        await new Promise((r) => setTimeout(r, 30));
+        const movesAfterClick = emitted.filter((p) => p.kind === "mouse-move").length;
+        expect(movesAfterClick).toBe(movesBeforeClick);
+        expect(emitted.some((p) => p.kind === "mouse-down" && p.x === 0.5 && p.y === 0.4)).toBe(true);
+
+        // Second rapid mousedown within 350ms and <6px triggers atomic mouse-dblclick snapped to initial pixel
+        element.dispatchEvent("mouseup", { clientX: 500, clientY: 400, button: 0 });
+        element.dispatchEvent("mousedown", { clientX: 502, clientY: 401, button: 0 });
+        const dblPackets = emitted.filter((p) => p.kind === "mouse-dblclick");
+        expect(dblPackets.length).toBeGreaterThanOrEqual(1);
+        expect(dblPackets[0]?.x).toBeCloseTo(0.5, 3);
+        expect(dblPackets[0]?.y).toBeCloseTo(0.4, 3);
+        expect(dblPackets[0]?.button).toBe("left");
+
+        // Native dblclick immediately after synthetic double-mousedown (<500ms) is deduplicated
+        const beforeNativeDbl = emitted.filter((p) => p.kind === "mouse-dblclick").length;
+        element.dispatchEvent("dblclick", { clientX: 250, clientY: 750, button: 0 });
+        expect(emitted.filter((p) => p.kind === "mouse-dblclick").length).toBe(beforeNativeDbl);
+
+        // Direct native dblclick beyond 500ms cooldown window emits mouse-dblclick
+        await new Promise((r) => setTimeout(r, 520));
+        element.dispatchEvent("dblclick", { clientX: 250, clientY: 750, button: 0 });
+        const afterNativeDbl = emitted.filter((p) => p.kind === "mouse-dblclick");
+        expect(afterNativeDbl.length).toBe(beforeNativeDbl + 1);
+        expect(afterNativeDbl[afterNativeDbl.length - 1]?.x).toBeCloseTo(0.25, 3);
+        expect(afterNativeDbl[afterNativeDbl.length - 1]?.y).toBeCloseTo(0.75, 3);
+
+        controller.detach();
+      } finally {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+        (globalThis as Record<string, unknown>).document = originalDocument;
+      }
+    });
+
+    it("NativeBridge bypasses 127.0.0.1:47831 in Tauri mode, limits mouse-move queue to 1, and executes click in <10ms", async () => {
+      const { NativeBridge } = await import("../../src/core/native-bridge");
+
+      const originalWindow = (globalThis as Record<string, unknown>).window;
+      const originalFetch = globalThis.fetch;
+      const originalWebSocket = globalThis.WebSocket;
+
+      const invokedCalls: Array<{
+        cmd: string;
+        packet: { kind?: string; x?: number; y?: number; button?: string } | undefined;
+        at: number;
+      }> = [];
+      let agentNetworkAttempted = false;
+
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("47831") || url.includes("127.0.0.1")) {
+          agentNetworkAttempted = true;
+        }
+        throw new Error(`Unexpected fetch in Tauri bypass test: ${url}`);
+      }) as unknown as typeof fetch;
+
+      (globalThis as Record<string, unknown>).WebSocket = class UnexpectedWebSocket {
+        constructor(url: string) {
+          if (url.includes("47831") || url.includes("127.0.0.1")) {
+            agentNetworkAttempted = true;
+          }
+        }
+      };
+
+      (globalThis as Record<string, unknown>).window = {
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        __TAURI_INTERNALS__: {
+          invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
+            const packet = args.packet as
+              | { kind?: string; x?: number; y?: number; button?: string }
+              | undefined;
+            invokedCalls.push({ cmd, packet, at: performance.now() });
+            if (cmd === "inject_mouse_event" && packet?.kind === "mouse-move") {
+              await new Promise((r) => setTimeout(r, 25));
+            }
+            return true;
+          },
+        },
+      };
+
+      try {
+        const bridge = new NativeBridge();
+        expect(bridge.isDesktopApp()).toBe(true);
+        const probeResult = await bridge.probeAgentNow();
+        expect(probeResult).toBe(true);
+        expect(agentNetworkAttempted).toBe(false);
+
+        // Queue 100 rapid mouse-move calls while first move is in-flight, then fire atomic double-click
+        for (let i = 0; i < 100; i++) {
+          void bridge.injectInput({ kind: "mouse-move", x: i / 100, y: i / 100 });
+        }
+
+        const clickDispatchedAt = performance.now();
+        await bridge.injectInput({ kind: "mouse-dblclick", x: 0.77, y: 0.88, button: "left" });
+        const clickFinishElapsedMs = performance.now() - clickDispatchedAt;
+
+        expect(clickFinishElapsedMs).toBeLessThan(10);
+
+        const dblInvoke = invokedCalls.find(
+          (c) => c.cmd === "inject_mouse_event" && c.packet?.kind === "mouse-dblclick",
+        );
+        if (!dblInvoke) {
+          throw new Error("Missing mouse-dblclick invoke");
+        }
+        expect(dblInvoke.packet?.x).toBe(0.77);
+        expect(dblInvoke.packet?.y).toBe(0.88);
+        expect(dblInvoke.at - clickDispatchedAt).toBeLessThan(10);
+
+        // Allow any in-flight promise to settle and verify at most 1 move ever executed (no 100-item backlog)
+        await new Promise((r) => setTimeout(r, 40));
+        const moveInvokes = invokedCalls.filter(
+          (c) => c.cmd === "inject_mouse_event" && c.packet?.kind === "mouse-move",
+        );
+        expect(moveInvokes.length).toBeLessThanOrEqual(2);
+        expect(agentNetworkAttempted).toBe(false);
+
+        bridge.stopAgentDiscovery();
+      } finally {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+        globalThis.fetch = originalFetch;
+        globalThis.WebSocket = originalWebSocket;
+      }
+    });
+  });
 });

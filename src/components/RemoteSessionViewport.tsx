@@ -129,6 +129,9 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   const [hasReceivedFirstFrame, setHasReceivedFirstFrame] = useState(false);
   const lastVideoTimeRef = useRef<number>(-1);
   const lastAdvanceTimestampRef = useRef<number>(0);
+  const latestMouseMoveRef = useRef<{ x: number; y: number } | null>(null);
+  const lastMoveEmitAtRef = useRef<number>(0);
+  const moveFlushTimerRef = useRef<number | null>(null);
 
   // Monitor arrival of fallback WSS frame
   useEffect(() => {
@@ -147,14 +150,19 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     }
   }, [fallbackFrameSize]);
 
-  // Notify parent when real WebRTC decoded video becomes active/inactive (with retry confirmation)
+  // Notify parent when real WebRTC decoded video becomes active/inactive (debounce inactive to avoid prematurely resuming WSS relay)
   useEffect(() => {
-    onWebRtcVideoActiveChangeRef.current?.(isWebRtcPlaying);
-    if (!isWebRtcPlaying) return;
-    const retryTimer = window.setTimeout(() => {
+    if (isWebRtcPlaying) {
       onWebRtcVideoActiveChangeRef.current?.(true);
+      const retryTimer = window.setTimeout(() => {
+        onWebRtcVideoActiveChangeRef.current?.(true);
+      }, 1500);
+      return () => window.clearTimeout(retryTimer);
+    }
+    const inactiveTimer = window.setTimeout(() => {
+      onWebRtcVideoActiveChangeRef.current?.(false);
     }, 1500);
-    return () => window.clearTimeout(retryTimer);
+    return () => window.clearTimeout(inactiveTimer);
   }, [isWebRtcPlaying]);
 
   // Attach stream to video element and verify actual decoded video frames (videoWidth > 0 and live/unfrozen)
@@ -246,12 +254,55 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
   useEffect(() => {
     if (isHost) return;
 
+    const clearPendingMove = () => {
+      if (moveFlushTimerRef.current !== null) {
+        window.clearTimeout(moveFlushTimerRef.current);
+        moveFlushTimerRef.current = null;
+      }
+      latestMouseMoveRef.current = null;
+    };
+
     const controller = new InputController({
       interceptClipboardShortcuts: true,
       onInputPacket: (packet) => {
-        if (allowInputRef.current) {
-          onSendInputPacketRef.current(packet);
+        if (!allowInputRef.current) return;
+        if (packet.kind === "mouse-move") {
+          const now = performance.now();
+          const elapsed = now - lastMoveEmitAtRef.current;
+          if (elapsed >= 16) {
+            clearPendingMove();
+            lastMoveEmitAtRef.current = now;
+            onSendInputPacketRef.current(packet);
+          } else {
+            latestMouseMoveRef.current = { x: packet.x, y: packet.y };
+            if (moveFlushTimerRef.current === null) {
+              moveFlushTimerRef.current = window.setTimeout(() => {
+                moveFlushTimerRef.current = null;
+                const pending = latestMouseMoveRef.current;
+                latestMouseMoveRef.current = null;
+                if (pending && allowInputRef.current) {
+                  lastMoveEmitAtRef.current = performance.now();
+                  onSendInputPacketRef.current({
+                    kind: "mouse-move",
+                    x: pending.x,
+                    y: pending.y,
+                  });
+                }
+              }, Math.max(1, Math.ceil(16 - elapsed)));
+            }
+          }
+          return;
         }
+        if (
+          packet.kind === "mouse-down" ||
+          packet.kind === "mouse-up" ||
+          packet.kind === "mouse-dblclick" ||
+          packet.kind === "key-down" ||
+          packet.kind === "key-up"
+        ) {
+          clearPendingMove();
+        }
+        onSendInputPacketRef.current(packet);
       },
     });
 
@@ -265,6 +316,7 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     }
 
     return () => {
+      clearPendingMove();
       controller.detach();
       inputControllerRef.current = null;
     };
@@ -631,6 +683,26 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
         }}
         onMouseLeave={() => setIsPointerOverVideo(false)}
         onMouseDown={(e) => {
+          if (moveFlushTimerRef.current !== null) {
+            window.clearTimeout(moveFlushTimerRef.current);
+            moveFlushTimerRef.current = null;
+          }
+          latestMouseMoveRef.current = null;
+          const rect = e.currentTarget.getBoundingClientRect();
+          clickRippleSeqRef.current += 1;
+          setClickRipple({
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+            key: clickRippleSeqRef.current,
+          });
+        }}
+        onDoubleClick={(e) => {
+          if (moveFlushTimerRef.current !== null) {
+            window.clearTimeout(moveFlushTimerRef.current);
+            moveFlushTimerRef.current = null;
+          }
+          latestMouseMoveRef.current = null;
+          inputControllerRef.current?.clearPendingMouseMove();
           const rect = e.currentTarget.getBoundingClientRect();
           clickRippleSeqRef.current += 1;
           setClickRipple({

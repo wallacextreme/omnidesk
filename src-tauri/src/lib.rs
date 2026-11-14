@@ -1,15 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-pub struct VirtualBounds {
-    pub left: i32,
-    pub top: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
 #[derive(Default)]
-pub struct ScreenBoundsState(pub std::sync::Mutex<VirtualBounds>);
+pub struct ScreenBoundsState {
+    pub virtual_x: std::sync::atomic::AtomicI32,
+    pub virtual_y: std::sync::atomic::AtomicI32,
+    pub virtual_width: std::sync::atomic::AtomicI32,
+    pub virtual_height: std::sync::atomic::AtomicI32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenFrameResult {
@@ -610,7 +607,7 @@ mod win_input {
         v.clamp(0.0, 1.0)
     }
 
-    fn send_mouse_move(x: f64, y: f64) {
+    fn compute_cursor_pos(x: f64, y: f64) -> (i32, i32, i32, i32) {
         let nx = clamp01(x);
         let ny = clamp01(y);
         let (v_left, v_top, v_w, v_h) = virtual_screen_bounds();
@@ -618,20 +615,33 @@ mod win_input {
         let py = v_top + (ny * ((v_h - 1).max(1) as f64)).round() as i32;
         let abs_x = (nx * 65535.0).round() as i32;
         let abs_y = (ny * 65535.0).round() as i32;
+        (px, py, abs_x, abs_y)
+    }
 
-        let inp = INPUT {
+    fn make_mouse_input(dx: i32, dy: i32, mouse_data: u32, dw_flags: u32) -> INPUT {
+        INPUT {
             r#type: INPUT_MOUSE,
             u: InputUnion {
                 mi: MOUSEINPUT {
-                    dx: abs_x,
-                    dy: abs_y,
-                    mouse_data: 0,
-                    dw_flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    dx,
+                    dy,
+                    mouse_data,
+                    dw_flags,
                     time: 0,
                     dw_extra_info: 0,
                 },
             },
-        };
+        }
+    }
+
+    fn send_mouse_move(x: f64, y: f64) {
+        let (px, py, abs_x, abs_y) = compute_cursor_pos(x, y);
+        let inp = make_mouse_input(
+            abs_x,
+            abs_y,
+            0,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        );
         unsafe {
             let _ = SetCursorPos(px, py);
             let _ = SendInput(1, &inp as *const INPUT, size_of::<INPUT>() as i32);
@@ -651,7 +661,7 @@ mod win_input {
                 let y = packet.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let btn = packet.get("button").and_then(|v| v.as_str()).unwrap_or("left");
                 let is_down = kind == "mouse-down";
-                send_mouse_move(x, y);
+                let (px, py, abs_x, abs_y) = compute_cursor_pos(x, y);
                 let dw_flags = match (btn, is_down) {
                     ("right", true) => MOUSEEVENTF_RIGHTDOWN,
                     ("right", false) => MOUSEEVENTF_RIGHTUP,
@@ -660,21 +670,45 @@ mod win_input {
                     (_, true) => MOUSEEVENTF_LEFTDOWN,
                     (_, false) => MOUSEEVENTF_LEFTUP,
                 };
-                let inp = INPUT {
-                    r#type: INPUT_MOUSE,
-                    u: InputUnion {
-                        mi: MOUSEINPUT {
-                            dx: 0,
-                            dy: 0,
-                            mouse_data: 0,
-                            dw_flags,
-                            time: 0,
-                            dw_extra_info: 0,
-                        },
-                    },
-                };
+                let coord_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                let inputs = [
+                    make_mouse_input(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | coord_flags),
+                    make_mouse_input(abs_x, abs_y, 0, dw_flags | coord_flags),
+                ];
                 unsafe {
-                    let _ = SendInput(1, &inp as *const INPUT, size_of::<INPUT>() as i32);
+                    let _ = SetCursorPos(px, py);
+                    let _ = SendInput(
+                        inputs.len() as u32,
+                        inputs.as_ptr(),
+                        size_of::<INPUT>() as i32,
+                    );
+                }
+            }
+            "mouse-dblclick" => {
+                let x = packet.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = packet.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let btn = packet.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+                let (px, py, abs_x, abs_y) = compute_cursor_pos(x, y);
+                let (down_flag, up_flag) = match btn {
+                    "right" => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                    "middle" => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                    _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                };
+                let coord_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                let inputs = [
+                    make_mouse_input(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | coord_flags),
+                    make_mouse_input(abs_x, abs_y, 0, down_flag | coord_flags),
+                    make_mouse_input(abs_x, abs_y, 0, up_flag | coord_flags),
+                    make_mouse_input(abs_x, abs_y, 0, down_flag | coord_flags),
+                    make_mouse_input(abs_x, abs_y, 0, up_flag | coord_flags),
+                ];
+                unsafe {
+                    let _ = SetCursorPos(px, py);
+                    let _ = SendInput(
+                        inputs.len() as u32,
+                        inputs.as_ptr(),
+                        size_of::<INPUT>() as i32,
+                    );
                 }
             }
             "mouse-wheel" => {
@@ -1059,14 +1093,18 @@ pub mod commands {
             .await
             .map_err(|e| format!("Screen capture worker failed: {e}"))??;
 
-            if let Ok(mut guard) = bounds_state.0.lock() {
-                *guard = super::VirtualBounds {
-                    left: result.virtual_left,
-                    top: result.virtual_top,
-                    width: result.virtual_width,
-                    height: result.virtual_height,
-                };
-            }
+            bounds_state
+                .virtual_x
+                .store(result.virtual_left, std::sync::atomic::Ordering::Relaxed);
+            bounds_state
+                .virtual_y
+                .store(result.virtual_top, std::sync::atomic::Ordering::Relaxed);
+            bounds_state
+                .virtual_width
+                .store(result.virtual_width, std::sync::atomic::Ordering::Relaxed);
+            bounds_state
+                .virtual_height
+                .store(result.virtual_height, std::sync::atomic::Ordering::Relaxed);
             return Ok(result);
         }
         #[cfg(not(target_os = "windows"))]

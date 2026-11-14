@@ -254,7 +254,7 @@ export class WebRTCManager {
       this.setupPeerConnectionEvents();
 
       // Reliable ordered DataChannel for control so key-up (Alt/Ctrl/Shift) and mouse-down/up never drop silently
-      this.controlChannel = this.pc.createDataChannel("control-channel", {
+      this.controlChannel = this.pc.createDataChannel("omnidesk-control", {
         ordered: true,
       });
       this.setupControlChannel(this.controlChannel);
@@ -451,7 +451,7 @@ export class WebRTCManager {
     // Client receives data channels created by host
     this.pc.ondatachannel = (event) => {
       const channel = event.channel;
-      if (channel.label === "control-channel") {
+      if (channel.label === "omnidesk-control" || channel.label === "control-channel") {
         this.controlChannel = channel;
         this.setupControlChannel(channel);
       } else if (channel.label === "transfer-channel") {

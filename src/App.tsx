@@ -171,6 +171,7 @@ export const App: React.FC = () => {
 
   // Chat & File Transfer State
   const [chatMessages, setChatMessages] = useState<ChatMessagePacket[]>([]);
+  const [hostReadChatCount, setHostReadChatCount] = useState<number>(0);
   const [activeTransferProgress, setActiveTransferProgress] = useState<FileTransferProgress | null>(null);
   const [receivedFiles, setReceivedFiles] = useState<
     Array<{ name: string; size: number; blob: Blob; sha256: string }>
@@ -220,6 +221,7 @@ export const App: React.FC = () => {
   const hostSecretRef = useRef<string>(getOrCreateHostSecret());
   const webrtcRef = useRef<WebRTCManager | null>(null);
   const frameRelayRef = useRef<FrameRelayHost | null>(null);
+  const clientReportedWebRtcFreezeRef = useRef<boolean>(false);
   const hostStreamRef = useRef<MediaStream | null>(null);
   const pendingSignalsRef = useRef<WebRTCSignalPayload[]>([]);
   const aclGuardRef = useRef<ACLGuard>(new ACLGuard(DEFAULT_ACL_PERMISSIONS));
@@ -294,6 +296,12 @@ export const App: React.FC = () => {
   useEffect(() => {
     defaultAclRef.current = defaultAcl;
   }, [defaultAcl]);
+
+  useEffect(() => {
+    if (hostChatOpen) {
+      setHostReadChatCount(chatMessages.length);
+    }
+  }, [hostChatOpen, chatMessages.length]);
 
   // Discover local Windows Native Agent (127.0.0.1:47831) for OS-level mouse/keyboard control
   useEffect(() => {
@@ -637,12 +645,21 @@ export const App: React.FC = () => {
         },
         onTelemetry: (stats) => {
           setTelemetry(stats);
+          if (
+            role === "host" &&
+            !clientReportedWebRtcFreezeRef.current &&
+            webrtcRef.current?.getConnectionState() === "connected" &&
+            stats.fps >= 2 &&
+            stats.bitrateKbps > 20
+          ) {
+            frameRelayRef.current?.pause();
+          }
         },
         onLocalStreamEnded: () => {
           handleEndSessionRef.current(true);
         },
         onConnectionStateChange: (state) => {
-          if (state === "failed") {
+          if (state === "failed" || state === "closed") {
             // Keep session active on WSS Frame Relay instead of abruptly closing
             if (role === "client") {
               setRemoteStream(null);
@@ -981,6 +998,7 @@ export const App: React.FC = () => {
 
               case "video-status": {
                 if (sessionRoleRef.current === "host" && msg.senderId === remotePeerIdRef.current) {
+                  clientReportedWebRtcFreezeRef.current = !msg.webrtcActive;
                   if (msg.webrtcActive) {
                     frameRelayRef.current?.pause();
                   } else {
@@ -1423,6 +1441,8 @@ export const App: React.FC = () => {
       setIsConnecting(false);
       setTelemetry({ rttMs: 0, fps: 0, bitrateKbps: 0, packetLossPercent: 0 });
       setChatMessages([]);
+      setHostReadChatCount(0);
+      clientReportedWebRtcFreezeRef.current = false;
       setActiveTransferProgress(null);
       setHostChatOpen(false);
       setHostFilesOpen(false);
@@ -1520,7 +1540,7 @@ export const App: React.FC = () => {
               onToggleChat={() => setHostChatOpen(!hostChatOpen)}
               onToggleFiles={() => setHostFilesOpen(!hostFilesOpen)}
               onEndSession={() => handleEndSession(true)}
-              unreadChatCount={chatMessages.length}
+              unreadChatCount={hostChatOpen ? 0 : Math.max(0, chatMessages.length - hostReadChatCount)}
               isSyntheticStream={hostIsSyntheticStream}
               onShareRealScreen={handleShareRealScreen}
               controlBridgeStatus={controlBridgeStatus}

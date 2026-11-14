@@ -795,8 +795,11 @@ export class WebRTCManager {
       try {
         const stats = await this.pc.getStats();
         let rttMs = 0;
-        let fps = 0;
+        let inboundFps = 0;
+        let outboundFps = 0;
         let bytesReceived = 0;
+        let bytesSent = 0;
+        let hasInboundVideo = false;
         let packetsLost = 0;
         let totalPackets = 0;
 
@@ -807,8 +810,9 @@ export class WebRTCManager {
             }
           }
           if (report.type === "inbound-rtp" && report.kind === "video") {
+            hasInboundVideo = true;
             if (typeof report.framesPerSecond === "number") {
-              fps = Math.round(report.framesPerSecond);
+              inboundFps = Math.round(report.framesPerSecond);
             }
             if (typeof report.bytesReceived === "number") {
               bytesReceived = report.bytesReceived;
@@ -820,17 +824,28 @@ export class WebRTCManager {
               totalPackets = report.packetsReceived + packetsLost;
             }
           }
+          if (report.type === "outbound-rtp" && report.kind === "video") {
+            if (typeof report.framesPerSecond === "number") {
+              outboundFps = Math.round(report.framesPerSecond);
+            }
+            if (typeof report.bytesSent === "number") {
+              bytesSent += report.bytesSent;
+            }
+          }
         });
+
+        const fps = hasInboundVideo ? inboundFps : outboundFps;
+        const bytesTransferred = hasInboundVideo ? bytesReceived : bytesSent;
 
         const now = Date.now();
         let bitrateKbps = 0;
-        if (this.lastStatsTimestamp > 0 && bytesReceived > this.lastBytesReceived) {
+        if (this.lastStatsTimestamp > 0 && bytesTransferred > this.lastBytesReceived) {
           const durationSec = (now - this.lastStatsTimestamp) / 1000;
-          const bits = (bytesReceived - this.lastBytesReceived) * 8;
+          const bits = (bytesTransferred - this.lastBytesReceived) * 8;
           bitrateKbps = Math.round(bits / durationSec / 1000);
         }
 
-        this.lastBytesReceived = bytesReceived;
+        this.lastBytesReceived = bytesTransferred;
         this.lastStatsTimestamp = now;
 
         const packetLossPercent =

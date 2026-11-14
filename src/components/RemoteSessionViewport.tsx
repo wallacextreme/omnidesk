@@ -127,6 +127,8 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     };
   }, [clickRipple]);
   const [hasReceivedFirstFrame, setHasReceivedFirstFrame] = useState(false);
+  const lastVideoTimeRef = useRef<number>(-1);
+  const lastAdvanceTimestampRef = useRef<number>(0);
 
   // Monitor arrival of fallback WSS frame
   useEffect(() => {
@@ -145,12 +147,17 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     }
   }, [fallbackFrameSize]);
 
-  // Notify parent when real WebRTC decoded video becomes active/inactive
+  // Notify parent when real WebRTC decoded video becomes active/inactive (with retry confirmation)
   useEffect(() => {
     onWebRtcVideoActiveChangeRef.current?.(isWebRtcPlaying);
+    if (!isWebRtcPlaying) return;
+    const retryTimer = window.setTimeout(() => {
+      onWebRtcVideoActiveChangeRef.current?.(true);
+    }, 1500);
+    return () => window.clearTimeout(retryTimer);
   }, [isWebRtcPlaying]);
 
-  // Attach stream to video element and verify actual decoded video frames (videoWidth > 0)
+  // Attach stream to video element and verify actual decoded video frames (videoWidth > 0 and live/unfrozen)
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -159,12 +166,16 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
       if (video.srcObject !== null) {
         video.srcObject = null;
       }
+      lastVideoTimeRef.current = -1;
+      lastAdvanceTimestampRef.current = 0;
       setIsWebRtcPlaying(false);
       return;
     }
 
     if (video.srcObject !== remoteStream) {
       video.srcObject = remoteStream;
+      lastVideoTimeRef.current = -1;
+      lastAdvanceTimestampRef.current = 0;
     }
     video.muted = true; // Crucial to prevent browser blocking autoplay
     video.play().catch((err) => {
@@ -172,9 +183,21 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     });
 
     const verifyVideoFrames = () => {
-      const hasDecodedFrame =
-        video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
-      setIsWebRtcPlaying(hasDecodedFrame);
+      const hasLiveTrack = remoteStream.getVideoTracks().some((t) => t.readyState === "live");
+      const hasDims = video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+      if (hasDims) {
+        const now = Date.now();
+        if (video.currentTime !== lastVideoTimeRef.current) {
+          lastVideoTimeRef.current = video.currentTime;
+          lastAdvanceTimestampRef.current = now;
+        } else if (lastAdvanceTimestampRef.current === 0) {
+          lastAdvanceTimestampRef.current = now;
+        }
+        const notFrozen = now - lastAdvanceTimestampRef.current < 3000;
+        setIsWebRtcPlaying(hasLiveTrack && notFrozen);
+      } else {
+        setIsWebRtcPlaying(false);
+      }
     };
 
     verifyVideoFrames();
@@ -350,11 +373,13 @@ export const RemoteSessionViewport: React.FC<RemoteSessionViewportProps> = ({
     };
   }, [isHost]);
 
-  // Handle unread messages
+  // Handle unread messages cleanly without false increments when closing drawer
+  const lastChatLenRef = useRef(chatMessages.length);
   useEffect(() => {
-    if (!isChatOpen && chatMessages.length > 0) {
-      setUnreadChatCount((prev) => prev + 1);
+    if (chatMessages.length > lastChatLenRef.current && !isChatOpen) {
+      setUnreadChatCount((prev) => prev + (chatMessages.length - lastChatLenRef.current));
     }
+    lastChatLenRef.current = chatMessages.length;
   }, [chatMessages.length, isChatOpen]);
 
   const handleOpenChat = () => {

@@ -312,6 +312,9 @@ export class NativeBridge implements INativeBridge {
   }
 
   public hasNativeScreenCapture(): boolean {
+    if (this.isDesktopApp()) {
+      return true;
+    }
     return (
       typeof navigator !== "undefined" &&
       typeof navigator.mediaDevices !== "undefined" &&
@@ -325,6 +328,130 @@ export class NativeBridge implements INativeBridge {
     return Boolean(stream && this.syntheticStreams.has(stream));
   }
 
+  private async captureTauriScreenFrame(
+    maxWidth = 1280,
+    quality = 68
+  ): Promise<{ dataUrl: string; width: number; height: number } | null> {
+    if (!this.isDesktopApp()) return null;
+    try {
+      const res = await this.invokeTauri<{ data_url: string; width: number; height: number }>(
+        "capture_screen_frame",
+        { maxWidth, quality }
+      );
+      if (res && typeof res.data_url === "string" && res.data_url.startsWith("data:image/")) {
+        return { dataUrl: res.data_url, width: res.width, height: res.height };
+      }
+    } catch (err) {
+      console.warn("[NativeBridge] Tauri capture_screen_frame failed:", err);
+    }
+    return null;
+  }
+
+  public async captureSingleFrame(
+    maxWidth = 960,
+    quality = 0.58
+  ): Promise<{ dataUrl: string; width: number; height: number } | null> {
+    if (this.isDesktopApp() && !this.forceSyntheticStream) {
+      return await this.captureTauriScreenFrame(
+        maxWidth,
+        Math.round(Math.max(25, Math.min(95, quality * 100)))
+      );
+    }
+    return null;
+  }
+
+  private drawDataUrlToCanvas(
+    canvas: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    dataUrl: string,
+    width: number,
+    height: number
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const targetW = Math.max(2, img.naturalWidth || width);
+        const targetH = Math.max(2, img.naturalHeight || height);
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+        ctx.drawImage(img, 0, 0, targetW, targetH);
+        resolve();
+      };
+      img.onerror = () => resolve();
+      img.src = dataUrl;
+    });
+  }
+
+  private async createTauriNativeScreenStream(): Promise<MediaStream | null> {
+    if (typeof document === "undefined" || !this.isDesktopApp()) return null;
+    const initial = await this.captureTauriScreenFrame(1280, 72);
+    if (!initial) return null;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(2, initial.width);
+    canvas.height = Math.max(2, initial.height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    await this.drawDataUrlToCanvas(canvas, ctx, initial.dataUrl, initial.width, initial.height);
+    if (typeof canvas.captureStream !== "function") return null;
+
+    const stream = canvas.captureStream(15);
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) return null;
+    if ("contentHint" in videoTrack) {
+      videoTrack.contentHint = "detail";
+    }
+
+    let stopped = false;
+    let nextTimer: ReturnType<typeof setTimeout> | null = null;
+    const stopLoop = () => {
+      stopped = true;
+      if (nextTimer) {
+        clearTimeout(nextTimer);
+        nextTimer = null;
+      }
+    };
+
+    const origStop = videoTrack.stop.bind(videoTrack);
+    videoTrack.stop = () => {
+      stopLoop();
+      origStop();
+    };
+    videoTrack.addEventListener("ended", stopLoop);
+
+    const scheduleNext = () => {
+      if (stopped || videoTrack.readyState !== "live") {
+        stopLoop();
+        return;
+      }
+      nextTimer = setTimeout(() => {
+        void pumpNext();
+      }, 66);
+    };
+
+    const pumpNext = async () => {
+      if (stopped || videoTrack.readyState !== "live") {
+        stopLoop();
+        return;
+      }
+      const frame = await this.captureTauriScreenFrame(1280, 68);
+      if (stopped || videoTrack.readyState !== "live") {
+        stopLoop();
+        return;
+      }
+      if (frame) {
+        await this.drawDataUrlToCanvas(canvas, ctx, frame.dataUrl, frame.width, frame.height);
+      }
+      scheduleNext();
+    };
+
+    scheduleNext();
+    return stream;
+  }
+
   public async captureScreen(
     _monitorId?: string,
     options?: { allowSyntheticFallback?: boolean }
@@ -336,6 +463,14 @@ export class NativeBridge implements INativeBridge {
       const synth = this.createSyntheticStream();
       this.syntheticStreams.add(synth);
       return synth;
+    }
+
+    // 0. In Tauri desktop app, capture the Windows desktop directly via leak-free Win32 GDI
+    if (this.isDesktopApp()) {
+      const nativeStream = await this.createTauriNativeScreenStream();
+      if (nativeStream) {
+        return nativeStream;
+      }
     }
 
     // 1. In browser with getDisplayMedia support (Secure context HTTPS or localhost)
@@ -422,7 +557,11 @@ export class NativeBridge implements INativeBridge {
       try {
         if (packet.kind.startsWith("mouse-")) {
           await this.invokeTauri("inject_mouse_event", { packet });
-        } else if (packet.kind.startsWith("key-") || packet.kind === "special-key") {
+        } else if (
+          packet.kind.startsWith("key-") ||
+          packet.kind === "special-key" ||
+          packet.kind === "release-all"
+        ) {
           await this.invokeTauri("inject_key_event", { packet });
         }
         return true;

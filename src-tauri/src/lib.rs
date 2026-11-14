@@ -1,5 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct VirtualBounds {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Default)]
+pub struct ScreenBoundsState(pub std::sync::Mutex<VirtualBounds>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenFrameResult {
+    pub data_url: String,
+    pub width: u32,
+    pub height: u32,
+    pub virtual_left: i32,
+    pub virtual_top: i32,
+    pub virtual_width: i32,
+    pub virtual_height: i32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MonitorInfo {
     pub id: String,
@@ -25,7 +47,18 @@ mod win_input {
     const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
     const MOUSEEVENTF_WHEEL: u32 = 0x0800;
     const MOUSEEVENTF_HWHEEL: u32 = 0x01000;
+    const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
     const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
+
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
+
+    const SRCCOPY: u32 = 0x00CC0020;
+    const HALFTONE: i32 = 4;
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
 
     const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
     const KEYEVENTF_KEYUP: u32 = 0x0002;
@@ -80,6 +113,8 @@ mod win_input {
         fn SetCursorPos(x: i32, y: i32) -> i32;
         fn LockWorkStation() -> i32;
         fn SetProcessDPIAware() -> i32;
+        fn GetDC(hwnd: isize) -> isize;
+        fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
         fn OpenClipboard(hwnd_new_owner: *const c_void) -> i32;
         fn CloseClipboard() -> i32;
         fn EmptyClipboard() -> i32;
@@ -87,6 +122,117 @@ mod win_input {
         fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
         fn GetClipboardSequenceNumber() -> u32;
         fn MessageBoxW(hwnd: *const c_void, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+    }
+
+    #[repr(C)]
+    struct POINT {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct BITMAPINFOHEADER {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct RGBQUAD {
+        rgb_blue: u8,
+        rgb_green: u8,
+        rgb_red: u8,
+        rgb_reserved: u8,
+    }
+
+    #[repr(C)]
+    struct BITMAPINFO {
+        bmi_header: BITMAPINFOHEADER,
+        bmi_colors: [RGBQUAD; 1],
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn CreateCompatibleBitmap(hdc: isize, cx: i32, cy: i32) -> isize;
+        fn SelectObject(hdc: isize, h: isize) -> isize;
+        fn DeleteObject(ho: isize) -> i32;
+        fn BitBlt(
+            hdc: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            hdc_src: isize,
+            x1: i32,
+            y1: i32,
+            rop: u32,
+        ) -> i32;
+        fn StretchBlt(
+            hdc_dest: isize,
+            x_dest: i32,
+            y_dest: i32,
+            w_dest: i32,
+            h_dest: i32,
+            hdc_src: isize,
+            x_src: i32,
+            y_src: i32,
+            w_src: i32,
+            h_src: i32,
+            rop: u32,
+        ) -> i32;
+        fn SetStretchBltMode(hdc: isize, mode: i32) -> i32;
+        fn SetBrushOrgEx(hdc: isize, x: i32, y: i32, lppt: *mut POINT) -> i32;
+        fn GetDIBits(
+            hdc: isize,
+            hbm: isize,
+            start: u32,
+            c_lines: u32,
+            lpv_bits: *mut u8,
+            lpbmi: *mut BITMAPINFO,
+            usage: u32,
+        ) -> i32;
+    }
+
+    /// RAII guard guaranteeing GDI DC/Bitmap/Selection cleanup on every exit path
+    /// so long remote sessions never exhaust Windows' 10,000 GDI object quota.
+    struct GdiCaptureGuard {
+        hdc_screen: isize,
+        hdc_mem: isize,
+        hbitmap: isize,
+        old_obj: isize,
+    }
+
+    impl Drop for GdiCaptureGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if self.hdc_mem != 0 && self.old_obj != 0 {
+                    SelectObject(self.hdc_mem, self.old_obj);
+                    self.old_obj = 0;
+                }
+                if self.hbitmap != 0 {
+                    DeleteObject(self.hbitmap);
+                    self.hbitmap = 0;
+                }
+                if self.hdc_mem != 0 {
+                    DeleteDC(self.hdc_mem);
+                    self.hdc_mem = 0;
+                }
+                if self.hdc_screen != 0 {
+                    ReleaseDC(0, self.hdc_screen);
+                    self.hdc_screen = 0;
+                }
+            }
+        }
     }
 
     #[link(name = "shell32")]
@@ -313,6 +459,153 @@ mod win_input {
         }
     }
 
+    pub fn virtual_screen_bounds() -> (i32, i32, i32, i32) {
+        unsafe {
+            let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if w > 0 && h > 0 {
+                (left, top, w, h)
+            } else {
+                let (pw, ph) = primary_screen_size();
+                (0, 0, pw as i32, ph as i32)
+            }
+        }
+    }
+
+    /// Captures the entire virtual desktop into top-down 32-bit BGRA bytes.
+    /// GdiCaptureGuard ensures SelectObject restoration and DeleteObject/DeleteDC/ReleaseDC
+    /// run unconditionally on every exit path, preventing GDI handle exhaustion.
+    pub fn capture_screen_bgra(
+        max_width: u32,
+    ) -> Result<(Vec<u8>, u32, u32, i32, i32, i32, i32), String> {
+        let (v_left, v_top, v_w, v_h) = virtual_screen_bounds();
+        if v_w <= 0 || v_h <= 0 {
+            return Err("Invalid virtual screen dimensions".into());
+        }
+
+        let target_max_w = max_width.clamp(320, 3840) as i32;
+        let (out_w, out_h) = if v_w > target_max_w {
+            let scaled_h = (((v_h as i64) * (target_max_w as i64)) / (v_w as i64)).max(2) as i32;
+            ((target_max_w & !1).max(2), (scaled_h & !1).max(2))
+        } else {
+            ((v_w.max(2) & !1).max(2), (v_h.max(2) & !1).max(2))
+        };
+
+        let mut guard = GdiCaptureGuard {
+            hdc_screen: 0,
+            hdc_mem: 0,
+            hbitmap: 0,
+            old_obj: 0,
+        };
+
+        unsafe {
+            guard.hdc_screen = GetDC(0);
+            if guard.hdc_screen == 0 {
+                return Err("GetDC(0) returned null".into());
+            }
+
+            guard.hdc_mem = CreateCompatibleDC(guard.hdc_screen);
+            if guard.hdc_mem == 0 {
+                return Err("CreateCompatibleDC failed".into());
+            }
+
+            guard.hbitmap = CreateCompatibleBitmap(guard.hdc_screen, out_w, out_h);
+            if guard.hbitmap == 0 {
+                return Err("CreateCompatibleBitmap failed".into());
+            }
+
+            let prev = SelectObject(guard.hdc_mem, guard.hbitmap);
+            if prev == 0 || prev == -1 {
+                return Err("SelectObject failed".into());
+            }
+            guard.old_obj = prev;
+
+            let blit_ok = if out_w != v_w || out_h != v_h {
+                let _ = SetStretchBltMode(guard.hdc_mem, HALFTONE);
+                let _ = SetBrushOrgEx(guard.hdc_mem, 0, 0, std::ptr::null_mut());
+                StretchBlt(
+                    guard.hdc_mem,
+                    0,
+                    0,
+                    out_w,
+                    out_h,
+                    guard.hdc_screen,
+                    v_left,
+                    v_top,
+                    v_w,
+                    v_h,
+                    SRCCOPY,
+                )
+            } else {
+                BitBlt(
+                    guard.hdc_mem,
+                    0,
+                    0,
+                    out_w,
+                    out_h,
+                    guard.hdc_screen,
+                    v_left,
+                    v_top,
+                    SRCCOPY,
+                )
+            };
+
+            if blit_ok == 0 {
+                return Err("BitBlt/StretchBlt screen capture failed".into());
+            }
+
+            // Deselect bitmap before calling GetDIBits as required by Win32 GDI
+            SelectObject(guard.hdc_mem, guard.old_obj);
+            guard.old_obj = 0;
+
+            let mut bmi = BITMAPINFO {
+                bmi_header: BITMAPINFOHEADER {
+                    bi_size: size_of::<BITMAPINFOHEADER>() as u32,
+                    bi_width: out_w,
+                    bi_height: -out_h, // Negative height produces top-down BGRA rows
+                    bi_planes: 1,
+                    bi_bit_count: 32,
+                    bi_compression: BI_RGB,
+                    bi_size_image: 0,
+                    bi_x_pels_per_meter: 0,
+                    bi_y_pels_per_meter: 0,
+                    bi_clr_used: 0,
+                    bi_clr_important: 0,
+                },
+                bmi_colors: [RGBQUAD {
+                    rgb_blue: 0,
+                    rgb_green: 0,
+                    rgb_red: 0,
+                    rgb_reserved: 0,
+                }],
+            };
+
+            let byte_len = (out_w as usize)
+                .checked_mul(out_h as usize)
+                .and_then(|px| px.checked_mul(4))
+                .ok_or_else(|| "Captured frame buffer overflow".to_string())?;
+            let mut pixels = vec![0u8; byte_len];
+
+            let lines = GetDIBits(
+                guard.hdc_mem,
+                guard.hbitmap,
+                0,
+                out_h as u32,
+                pixels.as_mut_ptr(),
+                &mut bmi as *mut BITMAPINFO,
+                DIB_RGB_COLORS,
+            );
+            if lines == 0 {
+                return Err("GetDIBits failed".into());
+            }
+
+            drop(guard);
+            Ok((pixels, out_w as u32, out_h as u32, v_left, v_top, v_w, v_h))
+        }
+    }
+
     fn clamp01(v: f64) -> f64 {
         v.clamp(0.0, 1.0)
     }
@@ -320,9 +613,9 @@ mod win_input {
     fn send_mouse_move(x: f64, y: f64) {
         let nx = clamp01(x);
         let ny = clamp01(y);
-        let (w, h) = primary_screen_size();
-        let px = (nx * ((w.saturating_sub(1)) as f64)).round() as i32;
-        let py = (ny * ((h.saturating_sub(1)) as f64)).round() as i32;
+        let (v_left, v_top, v_w, v_h) = virtual_screen_bounds();
+        let px = v_left + (nx * ((v_w - 1).max(1) as f64)).round() as i32;
+        let py = v_top + (ny * ((v_h - 1).max(1) as f64)).round() as i32;
         let abs_x = (nx * 65535.0).round() as i32;
         let abs_y = (ny * 65535.0).round() as i32;
 
@@ -333,7 +626,7 @@ mod win_input {
                     dx: abs_x,
                     dy: abs_y,
                     mouse_data: 0,
-                    dw_flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    dw_flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     time: 0,
                     dw_extra_info: 0,
                 },
@@ -728,68 +1021,148 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn read_clipboard_files() -> Result<Vec<ClipboardFileEntry>, String> {
+    pub async fn capture_screen_frame(
+        max_width: Option<u32>,
+        quality: Option<u8>,
+        bounds_state: tauri::State<'_, super::ScreenBoundsState>,
+    ) -> Result<super::ScreenFrameResult, String> {
         #[cfg(target_os = "windows")]
         {
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let paths = win_input::read_clipboard_file_paths()?;
-            let mut entries = Vec::new();
-            let mut next_map = std::collections::HashMap::new();
-            for raw_path in paths {
-                let pb = std::path::PathBuf::from(&raw_path);
-                let Ok(meta) = std::fs::metadata(&pb) else { continue; };
-                if !meta.is_file() || meta.len() > 157_286_400 {
-                    continue;
+            let target_w = max_width.unwrap_or(1280).clamp(320, 3840);
+            let jpeg_quality = quality.unwrap_or(68).clamp(25, 95);
+            let result = tokio::task::spawn_blocking(move || -> Result<super::ScreenFrameResult, String> {
+                let (pixels, width, height, v_left, v_top, v_w, v_h) =
+                    win_input::capture_screen_bgra(target_w)?;
+                let mut jpeg_buf = Vec::with_capacity(64 * 1024);
+                let encoder = jpeg_encoder::Encoder::new(&mut jpeg_buf, jpeg_quality);
+                encoder
+                    .encode(
+                        &pixels,
+                        width.min(u16::MAX as u32) as u16,
+                        height.min(u16::MAX as u32) as u16,
+                        jpeg_encoder::ColorType::Bgra,
+                    )
+                    .map_err(|e| format!("JPEG encode failed: {e}"))?;
+                let mut data_url = String::with_capacity(23 + (jpeg_buf.len() * 4) / 3 + 4);
+                data_url.push_str("data:image/jpeg;base64,");
+                data_url.push_str(&encode_base64(&jpeg_buf));
+                Ok(super::ScreenFrameResult {
+                    data_url,
+                    width,
+                    height,
+                    virtual_left: v_left,
+                    virtual_top: v_top,
+                    virtual_width: v_w,
+                    virtual_height: v_h,
+                })
+            })
+            .await
+            .map_err(|e| format!("Screen capture worker failed: {e}"))??;
+
+            if let Ok(mut guard) = bounds_state.0.lock() {
+                *guard = super::VirtualBounds {
+                    left: result.virtual_left,
+                    top: result.virtual_top,
+                    width: result.virtual_width,
+                    height: result.virtual_height,
+                };
+            }
+            return Ok(result);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (max_width, quality, bounds_state);
+            Err("Native GDI capture is only available on Windows".into())
+        }
+    }
+
+    #[tauri::command]
+    pub async fn read_clipboard_files() -> Result<Vec<ClipboardFileEntry>, String> {
+        #[cfg(target_os = "windows")]
+        {
+            return tokio::task::spawn_blocking(move || -> Result<Vec<ClipboardFileEntry>, String> {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let paths = win_input::read_clipboard_file_paths()?;
+                let mut entries = Vec::new();
+                let mut batch = Vec::new();
+                for raw_path in paths {
+                    let pb = std::path::PathBuf::from(&raw_path);
+                    let Ok(meta) = std::fs::metadata(&pb) else { continue; };
+                    if !meta.is_file() || meta.len() > 157_286_400 {
+                        continue;
+                    }
+                    let name = pb
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "arquivo.bin".to_string());
+                    let id = format!("tcf-{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    batch.push((id.clone(), pb));
+                    entries.push(ClipboardFileEntry {
+                        id,
+                        name,
+                        size: meta.len(),
+                    });
                 }
-                let name = pb
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "arquivo.bin".to_string());
-                let id = format!("tcf-{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                next_map.insert(id.clone(), pb);
-                entries.push(ClipboardFileEntry {
-                    id,
-                    name,
-                    size: meta.len(),
-                });
-            }
-            if let Ok(mut guard) = clipboard_allowlist().lock() {
-                *guard = next_map;
-            }
-            return Ok(entries);
+                if let Ok(mut guard) = clipboard_allowlist().lock() {
+                    for (k, v) in batch {
+                        guard.insert(k, v);
+                    }
+                    if guard.len() > 80 {
+                        let excess = guard.len() - 80;
+                        let mut by_age: Vec<(u64, String)> = guard
+                            .keys()
+                            .map(|k| {
+                                let num = k.strip_prefix("tcf-").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                                (num, k.clone())
+                            })
+                            .collect();
+                        by_age.sort_by_key(|(num, _)| *num);
+                        for (_, old_key) in by_age.into_iter().take(excess) {
+                            guard.remove(&old_key);
+                        }
+                    }
+                }
+                Ok(entries)
+            })
+            .await
+            .map_err(|e| format!("Clipboard files worker failed: {e}"))?;
         }
         #[cfg(not(target_os = "windows"))]
         Ok(Vec::new())
     }
 
     #[tauri::command]
-    pub fn read_clipboard_file_chunk(id: String, offset: u64, length: u32) -> Result<String, String> {
-        let path = {
-            let guard = clipboard_allowlist()
-                .lock()
-                .map_err(|_| "Clipboard allowlist lock poisoned".to_string())?;
-            guard.get(&id).cloned()
-        }
-        .ok_or_else(|| "Arquivo da área de transferência expirado ou não autorizado".to_string())?;
-
-        use std::io::{Read, Seek, SeekFrom};
-        let capped_len = (length as usize).clamp(1, 2 * 1024 * 1024);
-        let mut f = std::fs::File::open(&path).map_err(|e| format!("Failed opening clipboard file: {e}"))?;
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("Failed seeking clipboard file: {e}"))?;
-        let mut buf = vec![0u8; capped_len];
-        let mut total_read = 0usize;
-        while total_read < capped_len {
-            let n = f
-                .read(&mut buf[total_read..])
-                .map_err(|e| format!("Failed reading clipboard file: {e}"))?;
-            if n == 0 {
-                break;
+    pub async fn read_clipboard_file_chunk(id: String, offset: u64, length: u32) -> Result<String, String> {
+        tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let path = {
+                let guard = clipboard_allowlist()
+                    .lock()
+                    .map_err(|_| "Clipboard allowlist lock poisoned".to_string())?;
+                guard.get(&id).cloned()
             }
-            total_read += n;
-        }
-        Ok(encode_base64(&buf[..total_read]))
+            .ok_or_else(|| "Arquivo da área de transferência expirado ou não autorizado".to_string())?;
+
+            use std::io::{Read, Seek, SeekFrom};
+            let capped_len = (length as usize).clamp(1, 2 * 1024 * 1024);
+            let mut f = std::fs::File::open(&path).map_err(|e| format!("Failed opening clipboard file: {e}"))?;
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| format!("Failed seeking clipboard file: {e}"))?;
+            let mut buf = vec![0u8; capped_len];
+            let mut total_read = 0usize;
+            while total_read < capped_len {
+                let n = f
+                    .read(&mut buf[total_read..])
+                    .map_err(|e| format!("Failed reading clipboard file: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                total_read += n;
+            }
+            Ok(encode_base64(&buf[..total_read]))
+        })
+        .await
+        .map_err(|e| format!("Clipboard chunk worker failed: {e}"))?
     }
 
     fn sanitize_filename(raw: &str) -> String {
@@ -835,20 +1208,24 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn read_clipboard() -> Result<String, String> {
+    pub async fn read_clipboard() -> Result<String, String> {
         #[cfg(target_os = "windows")]
         {
-            return win_input::read_clipboard_text();
+            return tokio::task::spawn_blocking(win_input::read_clipboard_text)
+                .await
+                .map_err(|e| format!("Read clipboard worker failed: {e}"))?;
         }
         #[cfg(not(target_os = "windows"))]
         Ok(String::new())
     }
 
     #[tauri::command]
-    pub fn write_clipboard(text: String) -> Result<(), String> {
+    pub async fn write_clipboard(text: String) -> Result<(), String> {
         #[cfg(target_os = "windows")]
         {
-            return win_input::write_clipboard_text(&text);
+            return tokio::task::spawn_blocking(move || win_input::write_clipboard_text(&text))
+                .await
+                .map_err(|e| format!("Write clipboard worker failed: {e}"))?;
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -858,35 +1235,39 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn save_received_file(
+    pub async fn save_received_file(
         file_name: String,
         data_b64: String,
         auto_paste: Option<bool>,
     ) -> Result<String, String> {
-        let bytes = decode_base64(&data_b64)?;
-        let safe_name = sanitize_filename(&file_name);
-        let base_home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dest_dir = base_home.join("Downloads").join("OmniDesk");
-        std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed creating OmniDesk folder: {e}"))?;
-        let final_path = unique_dest_path(&dest_dir, &safe_name);
-        std::fs::write(&final_path, &bytes).map_err(|e| format!("Failed saving file: {e}"))?;
+        tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let bytes = decode_base64(&data_b64)?;
+            let safe_name = sanitize_filename(&file_name);
+            let base_home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dest_dir = base_home.join("Downloads").join("OmniDesk");
+            std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed creating OmniDesk folder: {e}"))?;
+            let final_path = unique_dest_path(&dest_dir, &safe_name);
+            std::fs::write(&final_path, &bytes).map_err(|e| format!("Failed saving file: {e}"))?;
 
-        let final_str = final_path.to_string_lossy().to_string();
-        #[cfg(target_os = "windows")]
-        {
-            let _ = win_input::set_clipboard_file_drop(&final_str);
-            if auto_paste.unwrap_or(false) {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                win_input::trigger_ctrl_v();
+            let final_str = final_path.to_string_lossy().to_string();
+            #[cfg(target_os = "windows")]
+            {
+                let _ = win_input::set_clipboard_file_drop(&final_str);
+                if auto_paste.unwrap_or(false) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    win_input::trigger_ctrl_v();
+                }
             }
-        }
-        #[cfg(not(target_os = "windows"))]
-        let _ = auto_paste;
+            #[cfg(not(target_os = "windows"))]
+            let _ = auto_paste;
 
-        Ok(final_str)
+            Ok(final_str)
+        })
+        .await
+        .map_err(|e| format!("Save file worker failed: {e}"))?
     }
 }
 
@@ -896,8 +1277,10 @@ pub fn run() {
     win_input::ensure_dpi_aware();
 
     if let Err(err) = tauri::Builder::default()
+        .manage(ScreenBoundsState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_monitors,
+            commands::capture_screen_frame,
             commands::inject_mouse_event,
             commands::inject_key_event,
             commands::release_all_inputs,

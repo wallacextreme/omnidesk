@@ -61,22 +61,39 @@ export class FrameRelayHost {
       this.canvas = document.createElement("canvas");
       this.ctx = this.canvas.getContext("2d", { willReadFrequently: false });
 
-      this.timer = setInterval(() => {
-        this.captureAndEmit(false);
-      }, this.intervalMs);
+      this.startCaptureTimer();
     } catch (err) {
       console.warn("[FrameRelayHost] Failed to initialize frame relay:", err);
     }
   }
 
+  private startCaptureTimer(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.timer = setInterval(() => {
+      this.captureAndEmit(false);
+    }, this.intervalMs);
+  }
+
   public pause(): void {
+    if (this.isPaused) return;
     this.isPaused = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
   }
 
   public resume(): void {
     if (!this.isRunning) return;
+    const wasPaused = this.isPaused;
     this.isPaused = false;
     this.lastFrameDataUrl = "";
+    if (wasPaused || !this.timer) {
+      this.startCaptureTimer();
+    }
     this.captureAndEmit(true);
   }
 
